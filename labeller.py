@@ -89,7 +89,9 @@ Output schema (per window dict)
 
 from __future__ import annotations
 
+import os
 import warnings
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -148,6 +150,10 @@ class LabellerConfig:
 
     # F0 agreement threshold (fractional difference)
     f0_agreement_threshold: float = 0.10
+
+    # Parallelism — number of worker processes.
+    # -1 = use all logical CPUs (default), 1 = serial (useful for debugging).
+    n_jobs: int = -1
 
 
 # ---------------------------------------------------------------------------
@@ -592,8 +598,92 @@ def _add_intra_sample_stds(windows: list[dict]) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Top-level picklable worker  (must be module-level for ProcessPoolExecutor)
+# ---------------------------------------------------------------------------
+
+def _worker_extract(
+    args: tuple[dict, LabellerConfig, VTLSmoother, str],
+) -> list[dict]:
+    """
+    Worker function: extract windows for one sample and add intra-sample stds.
+
+    Receives a (sample, cfg, smoother, pass_label) tuple so it can be
+    dispatched via ProcessPoolExecutor.map without lambda pickling issues.
+    The smoother is passed by value (pickled read-only snapshot).
+    """
+    sample, cfg, smoother, pass_label = args
+    wins = _extract_sample_windows(sample, cfg, smoother, pass_label)
+    return _add_intra_sample_stds(wins)
+
+
+def _worker_seed_vtl(
+    args: tuple[dict, LabellerConfig],
+) -> tuple[str, str, float]:
+    """
+    Worker function: compute a single centre-window VTL estimate for seeding.
+    Returns (group, speaker, vtl_mm).
+    """
+    s, cfg = args
+    audio   = s["audio"].astype(np.float32)
+    speaker = s.get("speaker", s.get("group", "unknown"))
+    group   = s.get("group", speaker)
+    sr      = s.get("sr", 16000)
+    n       = len(audio)
+    centre  = audio[n // 4 : 3 * n // 4]
+    snd     = parselmouth.Sound(centre, sampling_frequency=sr)
+    win_s   = max(cfg.win_ms, 3000.0 / cfg.min_f0_hz) / 1000.0
+    raw_f, _ = _extract_raw_formants(snd, cfg, win_s)
+    return group, speaker, _vtl_from_formants(raw_f)
+
+
+# ---------------------------------------------------------------------------
 # Two-pass dataset labeller
 # ---------------------------------------------------------------------------
+
+def _resolve_workers(n_jobs: int) -> int:
+    """Translate n_jobs=-1 to cpu_count(); clamp to at least 1."""
+    if n_jobs == -1:
+        return os.cpu_count() or 1
+    return max(1, n_jobs)
+
+
+def _parallel_extract(
+    samples: list[dict],
+    cfg: LabellerConfig,
+    smoother: VTLSmoother,
+    pass_label: str,
+    n_workers: int,
+    verbose: bool,
+    pass_name: str,
+) -> list[list[dict]]:
+    """
+    Fan out _worker_extract across all samples using ProcessPoolExecutor.
+    Preserves sample order.  Falls back to serial on n_workers==1.
+    """
+    n = len(samples)
+    args = [(s, cfg, smoother, pass_label) for s in samples]
+
+    if n_workers == 1:
+        results = []
+        for i, a in enumerate(args):
+            if verbose and i % max(1, n // 10) == 0:
+                print(f"  [{pass_name}] {i}/{n}", end="\r")
+            results.append(_worker_extract(a))
+        return results
+
+    results_by_idx: dict[int, list[dict]] = {}
+    with ProcessPoolExecutor(max_workers=n_workers) as pool:
+        futures = {pool.submit(_worker_extract, a): i for i, a in enumerate(args)}
+        done = 0
+        for fut in as_completed(futures):
+            idx = futures[fut]
+            results_by_idx[idx] = fut.result()
+            done += 1
+            if verbose and done % max(1, n // 10) == 0:
+                print(f"  [{pass_name}] {done}/{n}", end="\r")
+
+    return [results_by_idx[i] for i in range(n)]
+
 
 def label_dataset(
     samples: list[dict],
@@ -603,6 +693,16 @@ def label_dataset(
 ) -> list[dict]:
     """
     Run the full two-pass labelling pipeline on a dataset.
+
+    Parallelism is controlled by cfg.n_jobs:
+        -1  use all logical CPUs  (default)
+         1  serial — useful for debugging / profiling
+         N  use exactly N worker processes
+
+    The three extraction passes (pass 0, pass 1, pass 2) are each
+    parallelised at the sample level.  The VTL smoother seeding and
+    inter-pass aggregation steps are serial but fast (no Praat calls
+    per window, just one centre-window scan per sample for seeding).
 
     Parameters
     ----------
@@ -618,135 +718,156 @@ def label_dataset(
     if cfg is None:
         cfg = LabellerConfig()
 
+    n_workers = _resolve_workers(cfg.n_jobs)
+
     # Attach sr to samples that don't have it
     for s in samples:
         s.setdefault("sr", sr)
 
+    if verbose:
+        print(f"[labeller] {len(samples)} samples, "
+              f"{n_workers} worker{'s' if n_workers != 1 else ''}.")
+
     # -----------------------------------------------------------------------
-    # Pass 0: extract raw windows, build initial VTL statistics
+    # Seed pass: one fast centre-window VTL estimate per sample (parallel)
     # -----------------------------------------------------------------------
     if verbose:
-        print(f"[labeller] Pass 0 — raw extraction ({len(samples)} samples)…")
+        print("[labeller] Seeding VTL smoother…")
+
+    seed_args = [(s, cfg) for s in samples]
+    if n_workers == 1:
+        seed_results = [_worker_seed_vtl(a) for a in seed_args]
+    else:
+        with ProcessPoolExecutor(max_workers=n_workers) as pool:
+            seed_results = list(pool.map(_worker_seed_vtl, seed_args))
 
     smoother_raw = VTLSmoother(
         prior_strength=cfg.vtl_prior_strength,
         sample_alpha=cfg.vtl_sample_alpha,
     )
-
-    # First, populate smoother with raw VTL estimates from every sample
-    # (we do a quick single-window estimate at the centre of each sample)
-    for s in samples:
-        audio    = s["audio"].astype(np.float32)
-        speaker  = s.get("speaker", s.get("group", "unknown"))
-        group    = s.get("group", speaker)
-        sr_s     = s.get("sr", sr)
-        n        = len(audio)
-        centre   = audio[n // 4 : 3 * n // 4]   # middle 50 % for stability
-        snd      = parselmouth.Sound(centre, sampling_frequency=sr_s)
-        win_s    = max(cfg.win_ms, 3000.0 / cfg.min_f0_hz) / 1000.0
-        raw_f, _ = _extract_raw_formants(snd, cfg, win_s)
-        raw_vtl  = _vtl_from_formants(raw_f)
-        smoother_raw.update(group, speaker, raw_vtl)
-
-    # Now extract all windows using the populated smoother
-    pass0_by_sample: list[list[dict]] = []
-    for i, s in enumerate(samples):
-        if verbose and i % max(1, len(samples) // 10) == 0:
-            print(f"  {i}/{len(samples)}", end="\r")
-        wins = _extract_sample_windows(s, cfg, smoother_raw, pass_label="raw")
-        wins = _add_intra_sample_stds(wins)
-        pass0_by_sample.append(wins)
+    for group, speaker, vtl in seed_results:
+        smoother_raw.update(group, speaker, vtl)
 
     # -----------------------------------------------------------------------
-    # Pass 1: build refined VTL statistics from pass-0 formants
+    # Pass 0: full window extraction with seed smoother
     # -----------------------------------------------------------------------
     if verbose:
-        print(f"\n[labeller] Pass 1 — refining VTL estimates…")
+        print(f"[labeller] Pass 0 — raw extraction…")
 
+    pass0_by_sample = _parallel_extract(
+        samples, cfg, smoother_raw, "raw", n_workers, verbose, "pass0"
+    )
+
+    # -----------------------------------------------------------------------
+    # Inter-pass aggregation: build pass-1 smoother from pass-0 VTLs (serial)
+    # -----------------------------------------------------------------------
     smoother_first = VTLSmoother(
         prior_strength=cfg.vtl_prior_strength,
         sample_alpha=cfg.vtl_sample_alpha,
     )
-
     for wins in pass0_by_sample:
         if not wins:
             continue
         speaker = wins[0]["speaker"]
         group   = wins[0]["group"]
-        # Use mean vtl_mm across voiced windows from pass 0
-        vtls = [w["vtl_mm"] for w in wins if np.isfinite(w["vtl_mm"])]
+        vtls    = [w["vtl_mm"] for w in wins if np.isfinite(w["vtl_mm"])]
         if vtls:
             smoother_first.update(group, speaker, float(np.mean(vtls)))
 
-    # Re-extract all windows with refined smoother
-    pass1_by_sample: list[list[dict]] = []
-    for i, s in enumerate(samples):
-        if verbose and i % max(1, len(samples) // 10) == 0:
-            print(f"  {i}/{len(samples)}", end="\r")
-        wins = _extract_sample_windows(s, cfg, smoother_first, pass_label="first")
-        wins = _add_intra_sample_stds(wins)
-        pass1_by_sample.append(wins)
-
     # -----------------------------------------------------------------------
-    # Pass 2: final refinement — re-derive group/speaker VTL from pass-1
-    #         formants, smooth literature → group → speaker (no sample blend)
+    # Pass 1: re-extract with refined smoother
     # -----------------------------------------------------------------------
     if verbose:
-        print(f"\n[labeller] Pass 2 — final formant assignment…")
+        print(f"\n[labeller] Pass 1 — refining VTL estimates…")
 
+    pass1_by_sample = _parallel_extract(
+        samples, cfg, smoother_first, "first", n_workers, verbose, "pass1"
+    )
+
+    # -----------------------------------------------------------------------
+    # Inter-pass aggregation: build pass-2 smoother from pass-1 formants
+    # -----------------------------------------------------------------------
     smoother_second = VTLSmoother(
         prior_strength=cfg.vtl_prior_strength,
         sample_alpha=cfg.vtl_sample_alpha,
     )
-
     for wins in pass1_by_sample:
         if not wins:
             continue
         speaker = wins[0]["speaker"]
         group   = wins[0]["group"]
-        # Estimate per-sample VTL from pass-1 assigned formants
         sample_vtls = []
         for w in wins:
-            f_vec = np.array([w.get(f"f{i+1}_hz", np.nan) for i in range(N_FORMANTS)],
-                             dtype=np.float32)
+            f_vec = np.array(
+                [w.get(f"f{i+1}_hz", np.nan) for i in range(N_FORMANTS)],
+                dtype=np.float32,
+            )
             v = _vtl_from_formants(f_vec)
             if np.isfinite(v):
                 sample_vtls.append(v)
         if sample_vtls:
             smoother_second.update(group, speaker, float(np.mean(sample_vtls)))
 
-    # Final extraction — for vtl_mm we use speaker-smoothed value only
-    # (no per-sample blend in the final pass per design)
-    final_windows: list[dict] = []
-    for i, s in enumerate(samples):
-        if verbose and i % max(1, len(samples) // 10) == 0:
-            print(f"  {i}/{len(samples)}", end="\r")
+    # -----------------------------------------------------------------------
+    # Pass 2: final extraction
+    # For each sample we freeze the smoother at the per-speaker VTL
+    # (no sample-level blend in the final pass) and store that value.
+    # -----------------------------------------------------------------------
+    if verbose:
+        print(f"\n[labeller] Pass 2 — final formant assignment…")
 
-        speaker = s.get("speaker", s.get("group", "unknown"))
-        group   = s.get("group", speaker)
-
-        # Final VTL: smoothed speaker estimate, no sample-level blend
+    # Pre-compute frozen per-sample smoothers and inject final_vtl into each
+    # sample dict so the worker can stamp it onto windows without needing
+    # the live smoother object.
+    samples_pass2 = []
+    for s in samples:
+        speaker   = s.get("speaker", s.get("group", "unknown"))
+        group     = s.get("group", speaker)
         final_vtl = smoother_second.smoothed_speaker_vtl(group, speaker)
-
-        # Create a temporary smoother frozen at the final speaker VTL
-        frozen = VTLSmoother(prior_strength=1e9, sample_alpha=0.0)
+        frozen    = VTLSmoother(prior_strength=1e9, sample_alpha=0.0)
         frozen._speaker_vtls[speaker] = [final_vtl]
         frozen._group_vtls[group]     = [final_vtl]
+        # Shallow copy to avoid mutating caller's dict
+        s2 = dict(s, _final_vtl=final_vtl)
+        samples_pass2.append((s2, cfg, frozen, "second"))
 
-        wins = _extract_sample_windows(s, cfg, frozen, pass_label="second")
-        wins = _add_intra_sample_stds(wins)
+    if n_workers == 1:
+        pass2_by_sample = []
+        for i, a in enumerate(samples_pass2):
+            if verbose and i % max(1, len(samples) // 10) == 0:
+                print(f"  [pass2] {i}/{len(samples)}", end="\r")
+            pass2_by_sample.append(_worker_extract(a))
+    else:
+        results_by_idx: dict[int, list[dict]] = {}
+        with ProcessPoolExecutor(max_workers=n_workers) as pool:
+            futures = {
+                pool.submit(_worker_extract, a): i
+                for i, a in enumerate(samples_pass2)
+            }
+            done = 0
+            for fut in as_completed(futures):
+                idx = futures[fut]
+                results_by_idx[idx] = fut.result()
+                done += 1
+                if verbose and done % max(1, len(samples) // 10) == 0:
+                    print(f"  [pass2] {done}/{len(samples)}", end="\r")
+        pass2_by_sample = [results_by_idx[i] for i in range(len(samples))]
 
-        # Tag windows with final vtl source
+    # Stamp final_vtl onto every window and flatten
+    final_windows: list[dict] = []
+    for s_orig, wins in zip(samples, pass2_by_sample):
+        speaker   = s_orig.get("speaker", s_orig.get("group", "unknown"))
+        group     = s_orig.get("group", speaker)
+        final_vtl = smoother_second.smoothed_speaker_vtl(group, speaker)
         for w in wins:
             w["vtl_mm"] = final_vtl
-
         final_windows.extend(wins)
 
     if verbose:
         n_voiced = sum(1 for w in final_windows if np.isfinite(w["f0_hz"]))
         print(f"\n[labeller] Done. {len(final_windows)} windows "
               f"({n_voiced} voiced, "
-              f"{len(final_windows)-n_voiced} unvoiced) "
+              f"{len(final_windows) - n_voiced} unvoiced) "
               f"from {len(samples)} samples.")
 
     return final_windows
