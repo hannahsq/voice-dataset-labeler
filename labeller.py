@@ -889,6 +889,27 @@ UNCERTAINTY_COLS = (
 )
 
 
+# ---------------------------------------------------------------------------
+# Persistence helpers
+# ---------------------------------------------------------------------------
+
+def save_windows(windows: list[dict], path: str) -> None:
+    """Pickle a labelled window list to disk."""
+    import pickle
+    with open(path, "wb") as f:
+        pickle.dump(windows, f, protocol=pickle.HIGHEST_PROTOCOL)
+    print(f"Saved {len(windows)} windows to {path}")
+
+
+def load_windows(path: str) -> list[dict]:
+    """Load a pickled window list from disk."""
+    import pickle
+    with open(path, "rb") as f:
+        windows = pickle.load(f)
+    print(f"Loaded {len(windows)} windows from {path}")
+    return windows
+
+
 def to_arrays(
     windows: list[dict],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str]]:
