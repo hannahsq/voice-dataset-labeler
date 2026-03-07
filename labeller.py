@@ -139,13 +139,21 @@ class LabellerConfig:
     max_formant_hz:         float = 5500.0
     n_praat_formants:       int   = N_FORMANTS
     vtl_prior_strength:     float = 10.0    # n0 for uncertainty-weighted blend
-    vtl_sample_alpha:       float = 0.30    # fixed sample-level blend fraction
+    vtl_sample_alpha:       float = 0.30    # fixed sample-level blend fraction [0, 0.9]
     voicing_threshold_dbfs: float = -40.0
     f0_agreement_threshold: float = 0.10
     n_jobs:                 int   = -1      # -1 = all CPUs, 1 = serial
     adaptive_preemphasis:   bool  = True
     intensity_threshold_db: float = 40.0
     preemphasis_from_hz:    float = 50.0    # used only when adaptive_preemphasis=False
+
+    def __post_init__(self):
+        if not (0.0 <= self.vtl_sample_alpha <= 0.9):
+            raise ValueError(
+                f"vtl_sample_alpha={self.vtl_sample_alpha} is outside [0.0, 0.9]. "
+                f"Values above 0.9 risk cascading formant misassignment from "
+                f"degenerate per-window VTL estimates."
+            )
 
 
 # ---------------------------------------------------------------------------
