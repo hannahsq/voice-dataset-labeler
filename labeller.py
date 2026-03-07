@@ -123,8 +123,8 @@ class LabellerConfig:
     hop_ms:                 float = 5.0
     min_f0_hz:              float = 50.0
     max_f0_hz:              float = 600.0
-    max_formant_hz:         float = 9000.0
-    n_praat_formants:       int   = N_FORMANTS + 1
+    max_formant_hz:         float = 8000.0
+    n_praat_formants:       int   = N_FORMANTS
     vtl_prior_strength:     float = 10.0    # n0 for uncertainty-weighted blend
     vtl_sample_alpha:       float = 0.30    # fixed sample-level blend fraction
     voicing_threshold_dbfs: float = -40.0
@@ -925,6 +925,125 @@ def probe_full(
 
     return label_dataset(selected, cfg=cfg, sr=sr, verbose=verbose)
 
+
+# ---------------------------------------------------------------------------
+# Post-processing: per-window outlier flags
+# ---------------------------------------------------------------------------
+
+@dataclass
+class OutlierConfig:
+    # F1 physiological bounds — group-specific ceilings applied where known
+    f1_floor_hz:          float      = 200.0
+    f1_ceil_adult_hz:     float      = 900.0    # men / women
+    f1_ceil_child_hz:     float      = 1050.0   # boys / girls
+    _child_groups:        frozenset  = frozenset({"boys", "girls"})
+
+    # VTL: flag windows outside speaker_mean +/- vtl_std_threshold * speaker_std
+    vtl_std_threshold:    float      = 3.0
+
+    # Formant gap: flag windows where any adjacent assigned formant pair
+    # exceeds gap_threshold * expected_delta_F (suggests a missed formant
+    # slipped through the assignment step)
+    formant_gap_threshold: float     = 2.2
+
+    # Flag unvoiced windows (NaN f0) — not "bad" data but often useful to
+    # mask separately at training time
+    flag_unvoiced:        bool       = True
+
+
+def flag_outliers(
+    labelled: list[dict],
+    cfg: Optional[OutlierConfig] = None,
+) -> list[dict]:
+    """
+    Add per-window outlier flag arrays to each labelled sample dict.
+
+    Modifies the dicts in-place and returns the same list for chaining.
+    Each sample gains an ``outlier_flags`` dict of named boolean (N,) arrays
+    (True = outlier window), and a combined ``outlier_mask`` (N,) bool array
+    that is the logical OR of all active checks.
+
+    Checks
+    ------
+    f1_bounds     : F1 below floor or above group-appropriate ceiling
+    vtl_range     : VTL outside speaker_mean +/- vtl_std_threshold * speaker_std
+    formant_gap   : adjacent assigned formants further apart than
+                    gap_threshold * the uniform-tube expected spacing for that window
+    unvoiced      : f0_hz is NaN  (only added when cfg.flag_unvoiced is True)
+
+    Parameters
+    ----------
+    labelled : output of label_dataset(), probe_full(), or probe_raw_formants()
+    cfg      : OutlierConfig (uses defaults if None)
+
+    Returns
+    -------
+    The same list, with ``outlier_flags`` and ``outlier_mask`` added in-place.
+    """
+    if cfg is None:
+        cfg = OutlierConfig()
+
+    # Pre-compute per-speaker VTL mean and std across all their windows
+    spk_vals: dict[str, list[float]] = {}
+    for s in labelled:
+        vtls = s["vtl_sample_mm"]
+        spk_vals.setdefault(s["speaker"], []).extend(
+            vtls[np.isfinite(vtls)].tolist()
+        )
+    spk_mean = {spk: float(np.mean(v)) for spk, v in spk_vals.items() if v}
+    spk_std  = {spk: float(np.std(v))  for spk, v in spk_vals.items() if v}
+
+    for s in labelled:
+        N       = len(s["t_centre_s"])
+        speaker = s["speaker"]
+        group   = s["group"]
+        flags: dict[str, np.ndarray] = {}
+
+        # --- F1 bounds ---
+        f1      = s["formant_hz"][:, 0]
+        f1_ceil = (cfg.f1_ceil_child_hz
+                   if group in cfg._child_groups
+                   else cfg.f1_ceil_adult_hz)
+        flags["f1_bounds"] = (
+            np.isfinite(f1) & ((f1 < cfg.f1_floor_hz) | (f1 > f1_ceil))
+        )
+
+        # --- VTL range ---
+        vtl   = s["vtl_sample_mm"]
+        mu    = spk_mean.get(speaker, np.nan)
+        sigma = spk_std.get(speaker, np.nan)
+        if np.isfinite(mu) and np.isfinite(sigma) and sigma > 0:
+            flags["vtl_range"] = (
+                np.isfinite(vtl) &
+                (np.abs(vtl - mu) > cfg.vtl_std_threshold * sigma)
+            )
+        else:
+            flags["vtl_range"] = np.zeros(N, dtype=bool)
+
+        # --- Formant gap ---
+        fhz       = s["formant_hz"]   # (N, 7)
+        gap_flags = np.zeros(N, dtype=bool)
+        for w in range(N):
+            vtl_w = float(vtl[w])
+            if not np.isfinite(vtl_w) or vtl_w <= 0:
+                continue
+            expected_delta = SPEED_OF_SOUND_MM_S / (2.0 * vtl_w)
+            row        = fhz[w]
+            valid_idx  = np.where(np.isfinite(row))[0]
+            for a, b in zip(valid_idx[:-1], valid_idx[1:]):
+                if row[b] - row[a] > cfg.formant_gap_threshold * expected_delta:
+                    gap_flags[w] = True
+                    break
+        flags["formant_gap"] = gap_flags
+
+        # --- Unvoiced ---
+        if cfg.flag_unvoiced:
+            flags["unvoiced"] = ~np.isfinite(s["f0_hz"])
+
+        s["outlier_flags"] = flags
+        s["outlier_mask"]  = np.logical_or.reduce(list(flags.values()))
+
+    return labelled
 
 
 
