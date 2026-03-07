@@ -792,6 +792,136 @@ def label_dataset(
     return pass2
 
 
+
+# ---------------------------------------------------------------------------
+# Incremental labelling: add new samples using an existing labelled dataset
+# ---------------------------------------------------------------------------
+
+def _smoother_from_labelled(
+    labelled: list[dict],
+    cfg: LabellerConfig,
+) -> VTLSmoother:
+    """
+    Build a VTLSmoother pre-populated from vtl_sample_mm arrays in an
+    already-labelled dataset.  Uses per-speaker means so each speaker
+    contributes one effective observation to the smoother, consistent with
+    how inter-pass aggregation works in label_dataset().
+    """
+    smoother = VTLSmoother(cfg.vtl_prior_strength, cfg.vtl_sample_alpha)
+    for s in labelled:
+        vtls = s["vtl_sample_mm"][np.isfinite(s["vtl_sample_mm"])]
+        if len(vtls):
+            smoother.update(s["group"], s["speaker"], float(np.mean(vtls)))
+    return smoother
+
+
+def label_incremental(
+    new_samples: list[dict],
+    existing: list[dict],
+    cfg: Optional[LabellerConfig] = None,
+    sr: int = 16000,
+    refine: bool = False,
+    verbose: bool = True,
+) -> list[dict]:
+    """
+    Label new samples using the pooled VTL statistics from an already-labelled
+    dataset for smoothing, without re-running the full pipeline on everything.
+
+    When ``refine=False`` (default):
+        A single pass-2-equivalent extraction is run on ``new_samples`` only,
+        using a smoother pre-populated from ``existing``.  Only the newly
+        labelled samples are returned.
+
+    When ``refine=True``:
+        After the initial single-pass labelling of ``new_samples``, a full
+        three-pass label_dataset() run is performed over the combined dataset
+        (existing + new).  The full combined result is returned, so existing
+        labels are updated as well.  Use this when the new samples represent
+        a meaningfully different demographic and you want the smoothed VTL
+        estimates to reflect the combined distribution.
+
+    Parameters
+    ----------
+    new_samples : unlabelled sample dicts (same format as label_dataset input)
+    existing    : already-labelled sample dicts (output of label_dataset)
+    cfg         : LabellerConfig (uses defaults if None)
+    sr          : fallback sample rate
+    refine      : if True, re-run the full pipeline over the combined dataset
+    verbose     : print progress
+
+    Returns
+    -------
+    If refine=False: list of newly labelled sample dicts (len == len(new_samples))
+    If refine=True:  combined list (existing re-labelled + new), len ==
+                     len(existing) + len(new_samples)
+    """
+    if cfg is None:
+        cfg = LabellerConfig()
+
+    for s in new_samples:
+        s.setdefault("sr", sr)
+
+    n_workers = _resolve_workers(cfg.n_jobs)
+
+    if verbose:
+        print(f"[label_incremental] {len(new_samples)} new samples, "
+              f"{len(existing)} existing — refine={refine}.")
+
+    # Build smoother from existing labelled data
+    smoother = _smoother_from_labelled(existing, cfg)
+
+    if verbose:
+        groups = {}
+        for s in existing:
+            groups[s["group"]] = groups.get(s["group"], 0) + 1
+        breakdown = ", ".join(f"{g}={n}" for g, n in sorted(
+            groups.items(), key=lambda x: str(x[0])
+        ))
+        print(f"[label_incremental] Smoother seeded from existing: {breakdown}")
+
+    # Single pass with frozen per-speaker VTL (pass-2 equivalent)
+    if verbose:
+        print("[label_incremental] Labelling new samples (single pass)...")
+
+    frozen_args = []
+    for s in new_samples:
+        speaker   = s.get("speaker", s.get("group", "unknown"))
+        group     = s.get("group", speaker)
+        final_vtl = smoother.smoothed_speaker_vtl(group, speaker)
+        frozen    = VTLSmoother(prior_strength=1e9, sample_alpha=0.0)
+        frozen._speaker_vtls[speaker] = [final_vtl]
+        frozen._group_vtls[group]     = [final_vtl]
+        frozen_args.append((dict(s), cfg, frozen))
+
+    new_labelled = _parallel_map(frozen_args, n_workers, verbose, "incremental")
+
+    if verbose:
+        n_voiced = sum(int(np.isfinite(s["f0_hz"]).any()) for s in new_labelled)
+        print(f"\n[label_incremental] {len(new_labelled)} new samples labelled "
+              f"({n_voiced} with at least one voiced window).")
+
+    if not refine:
+        return new_labelled
+
+    # Refinement: full pipeline over combined dataset
+    if verbose:
+        print("[label_incremental] Running refinement pass over combined dataset...")
+
+    # Strip labeller output keys from existing so label_dataset receives
+    # clean input dicts (it only needs the raw audio + metadata fields).
+    _output_keys = {
+        "t_centre_s", "loudness_dbfs", "spectral_slope", "f0_hz", "periodicity",
+        "f0_praat_hz", "f0_pyin_hz", "formant_hz", "formant_bw_hz",
+        "vtl_sample_mm", "window_length_ms", "hop_ms",
+        "outlier_flags", "outlier_mask",
+    }
+    def _strip(s: dict) -> dict:
+        return {k: v for k, v in s.items() if k not in _output_keys}
+
+    combined_raw = [_strip(s) for s in existing] + list(new_samples)
+    return label_dataset(combined_raw, cfg=cfg, sr=sr, verbose=verbose)
+
+
 # ---------------------------------------------------------------------------
 # Sanity-check probe: raw single pass, one sample per group
 # ---------------------------------------------------------------------------
