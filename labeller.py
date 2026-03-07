@@ -110,7 +110,7 @@ VTL_PRIOR_MM: dict[str, float] = {
 
 FORMANT_MATCH_TOLERANCE = 0.45   # +/- fraction of delta-F for pole assignment
 
-N_FORMANTS = 6
+N_FORMANTS = 5
 
 
 # ---------------------------------------------------------------------------
@@ -123,8 +123,8 @@ class LabellerConfig:
     hop_ms:                 float = 5.0
     min_f0_hz:              float = 50.0
     max_f0_hz:              float = 600.0
-    max_formant_hz:         float = 8000.0
     n_praat_formants:       int   = N_FORMANTS
+    max_formant_hz:         float = 5500.0
     vtl_prior_strength:     float = 10.0    # n0 for uncertainty-weighted blend
     vtl_sample_alpha:       float = 0.30    # fixed sample-level blend fraction
     voicing_threshold_dbfs: float = -40.0
@@ -246,13 +246,19 @@ def _extract_raw_formants(
     sr: int,
     cfg: LabellerConfig,
     win_s: float,
+    max_formant_hz: Optional[float] = None,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """
     Extract raw Praat poles from a frame.  Applies adaptive pre-emphasis when
     cfg.adaptive_preemphasis is True, disabling Praat's own filter.
 
+    max_formant_hz overrides cfg.max_formant_hz when provided — used by
+    _extract_sample to pass in a speaker-adapted ceiling derived from the
+    smoothed VTL estimate.
+
     Returns (freqs, bws, spectral_slope) — arrays are (n_praat_formants,).
     """
+    ceiling        = max_formant_hz if max_formant_hz is not None else cfg.max_formant_hz
     spectral_slope = np.nan
     analysis       = frame.astype(np.float32)
 
@@ -270,7 +276,7 @@ def _extract_raw_formants(
     try:
         fp      = call(snd, "To FormantPath (burg)...",
                        win_s / 2.0, cfg.n_praat_formants,
-                       cfg.max_formant_hz, win_s,
+                       ceiling, win_s,
                        praat_preemph, 0.05, 4)
         formant = call(fp, "Extract Formant")
     except Exception:
@@ -278,7 +284,7 @@ def _extract_raw_formants(
             formant = snd.to_formant_burg(
                 time_step=win_s / 2.0,
                 max_number_of_formants=cfg.n_praat_formants,
-                maximum_formant=cfg.max_formant_hz,
+                maximum_formant=ceiling,
                 window_length=win_s,
                 pre_emphasis_from=praat_preemph,
             )
@@ -439,6 +445,22 @@ def _extract_sample(
     win_samples = min(int(round(sr * win_s)), len(audio))
     hop_samples = max(1, int(round(sr * cfg.hop_ms / 1000.0)))
 
+    # Derive a speaker-adapted formant ceiling from the smoothed speaker VTL.
+    # Formula: N_FORMANTS * delta_F  where  delta_F = c / (2L)
+    # Clamped to [4500, 8000] Hz so it stays physiologically meaningful.
+    # Falls back to cfg.max_formant_hz when the smoother has no VTL data yet
+    # (e.g. during the seed pass when called from _worker_seed_vtl).
+    speaker_vtl = vtl_smoother.smoothed_speaker_vtl(group, speaker)
+    if np.isfinite(speaker_vtl) and speaker_vtl > 0:
+        # (N_FORMANTS + 0.5) * delta_F: half a spacing above the top formant
+        # gives headroom without inviting spurious extra poles.
+        dynamic_ceiling = float(np.clip(
+            (N_FORMANTS + 0.5) * SPEED_OF_SOUND_MM_S / (2.0 * speaker_vtl),
+            4500.0, 8000.0,
+        ))
+    else:
+        dynamic_ceiling = cfg.max_formant_hz
+
     # Pre-allocate accumulators
     t_centres, loudness_arr, slope_arr = [], [], []
     f0_arr, period_arr, f0p_arr, f0y_arr = [], [], [], []
@@ -462,7 +484,7 @@ def _extract_sample(
 
         period = _periodicity(frame, sr, f0)
 
-        raw_freqs, raw_bws, slope = _extract_raw_formants(frame, sr, cfg, win_s)
+        raw_freqs, raw_bws, slope = _extract_raw_formants(frame, sr, cfg, win_s, dynamic_ceiling)
         vtl_raw      = _vtl_from_formants(raw_freqs)
         smoothed_vtl = vtl_smoother.smooth_vtl(group, speaker, vtl_raw)
         freqs_out, bws_out = _assign_formant_indices(raw_freqs, raw_bws, smoothed_vtl)
