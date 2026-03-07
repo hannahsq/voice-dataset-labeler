@@ -25,10 +25,11 @@ label
     with non-rhotic /ew/) should happen at analysis time, not load time.
 
 group
-    Coarse demographic grouping. Used by the VTL group-stats reporter and
-    for cross-dataset stratification. Hillenbrand uses "men"/"women"/
-    "boys"/"girls"; personal datasets use the speaker name as group if no
-    finer demographic mapping is provided.
+    (sex, age) tuple identifying the demographic group for VTL prior lookup
+    and outlier flagging.  sex is one of "male"/"female"/"unknown"; age is
+    one of "adult"/"child"/"unknown".  Hillenbrand speakers map to fully
+    specified tuples; datasets with unknown demographics use "unknown" for
+    the relevant dimension(s).
 
 speaker
     Unique ID within the dataset. For Hillenbrand this is parsed from the
@@ -87,12 +88,12 @@ HILLENBRAND_TO_IPA: dict[str, str] = {
     "uw": "u",   # who'd
 }
 
-# Hillenbrand group codes in filenames -> demographic label
-_HILLENBRAND_GROUP_CODE: dict[str, str] = {
-    "m": "men",
-    "w": "women",
-    "b": "boys",
-    "g": "girls",
+# Hillenbrand group codes in filenames -> (sex, age) tuple
+_HILLENBRAND_GROUP_CODE: dict[str, tuple] = {
+    "m": ("male",   "adult"),
+    "w": ("female", "adult"),
+    "b": ("male",   "child"),
+    "g": ("female", "child"),
 }
 
 
@@ -133,12 +134,12 @@ def _parse_hillenbrand_speaker(item: dict, first_item: bool = False) -> str:
     return "unknown"
 
 
-def _hillenbrand_group_from_speaker(speaker: str) -> str:
-    """Map speaker ID like 'm01' to demographic group label."""
+def _hillenbrand_group_from_speaker(speaker: str) -> tuple:
+    """Map speaker ID like 'm01' to (sex, age) group tuple."""
     if speaker == "unknown":
-        return "unknown"
+        return ("unknown", "unknown")
     code = speaker[0].lower()
-    return _HILLENBRAND_GROUP_CODE.get(code, "unknown")
+    return _HILLENBRAND_GROUP_CODE.get(code, ("unknown", "unknown"))
 
 
 # ---------------------------------------------------------------------------
@@ -158,8 +159,9 @@ def load_hillenbrand(split: str = "train", sr: int = 16000) -> list[dict]:
     label    : IPA symbol via HILLENBRAND_TO_IPA
     speaker  : parsed from filename column (e.g. "m01") -- falls back to
                "unknown" with a warning if no filename column is found
-    group    : derived from speaker code ("men"/"women"/"boys"/"girls"),
-               falling back to the raw "group" column if parsing fails
+    group    : (sex, age) tuple derived from speaker code, e.g.
+               ("male", "adult") for "m01"; falls back to
+               ("unknown", "unknown") if parsing fails
     dialect  : "en-US-GenAm" (all Hillenbrand speakers are General American)
     modality : "spoken" (all Hillenbrand recordings are read speech)
     source   : "hillenbrand1995"
@@ -190,9 +192,7 @@ def load_hillenbrand(split: str = "train", sr: int = 16000) -> list[dict]:
         ipa_label = HILLENBRAND_TO_IPA.get(raw_label, raw_label)
 
         speaker = _parse_hillenbrand_speaker(item, first_item=(idx == 0))
-        group   = _hillenbrand_group_from_speaker(speaker)
-        if group == "unknown":
-            group = item.get("group", "unknown")
+        group = _hillenbrand_group_from_speaker(speaker)
 
         dataset.append({
             "audio":        audio,

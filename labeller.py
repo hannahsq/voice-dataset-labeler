@@ -99,13 +99,26 @@ import librosa
 
 SPEED_OF_SOUND_MM_S = 350_000.0   # mm/s — warm, humid vocal tract interior
 
-# Literature VTL priors (mm) — Fitch & Giedd (1999) / Story (2005)
-VTL_PRIOR_MM: dict[str, float] = {
-    "men":      174.0,
-    "women":    148.0,
-    "boys":     128.0,
-    "girls":    123.0,
-    "_default": 148.0,
+# Valid values for the sex and age dimensions of the group tuple.
+# Exported so dataset loaders can validate against the same constants.
+VALID_SEX: frozenset = frozenset({"male", "female", "unknown"})
+VALID_AGE: frozenset = frozenset({"adult", "child",  "unknown"})
+
+# Literature VTL priors (mm) keyed by (sex, age) tuples.
+# Fitch & Giedd (1999) / Story (2005).
+# Fallback hierarchy (most to least specific):
+#   (sex, age) -> (sex, "unknown") -> ("unknown", age) -> ("unknown", "unknown")
+VTL_PRIOR_MM: dict = {
+    ("male",    "adult"):   174.0,
+    ("female",  "adult"):   148.0,
+    ("male",    "child"):   128.0,
+    ("female",  "child"):   123.0,
+    # collapsed dimensions
+    ("male",    "unknown"): 151.0,   # mean of male adult + child
+    ("female",  "unknown"): 135.5,   # mean of female adult + child
+    ("unknown", "adult"):   161.0,   # mean of male + female adult
+    ("unknown", "child"):   125.5,   # mean of male + female child
+    ("unknown", "unknown"): 148.0,   # whole-dataset mean (literature)
 }
 
 FORMANT_MATCH_TOLERANCE = 0.45   # +/- fraction of delta-F for pole assignment
@@ -375,24 +388,43 @@ class VTLSmoother:
     """
     Blends group/speaker VTL statistics with the literature prior using
     uncertainty-weighted alphas:  alpha = n / (n + n0).
+
+    group is a (sex, age) tuple, e.g. ("female", "adult").
+    Unknown dimensions are represented as "unknown":
+        ("male",    "unknown")  -- sex known, age unknown
+        ("unknown", "adult")    -- age known, sex unknown
+        ("unknown", "unknown")  -- neither known
+
+    Prior fallback hierarchy (most to least specific):
+        (sex, age) -> (sex, "unknown") -> ("unknown", age) -> ("unknown", "unknown")
     """
 
     def __init__(self, prior_strength: float = 10.0, sample_alpha: float = 0.30):
         self.n0           = prior_strength
         self.sample_alpha = sample_alpha
-        self._group_vtls:   dict[str, list[float]] = {}
-        self._speaker_vtls: dict[str, list[float]] = {}
+        self._group_vtls:   dict[tuple, list[float]] = {}
+        self._speaker_vtls: dict[str,   list[float]] = {}
 
-    def update(self, group: str, speaker: str, vtl_mm: float) -> None:
+    def update(self, group: tuple, speaker: str, vtl_mm: float) -> None:
         if not np.isfinite(vtl_mm):
             return
         self._group_vtls.setdefault(group, []).append(vtl_mm)
         self._speaker_vtls.setdefault(speaker, []).append(vtl_mm)
 
-    def _prior(self, group: str) -> float:
-        return VTL_PRIOR_MM.get(group, VTL_PRIOR_MM["_default"])
+    def _prior(self, group: tuple) -> float:
+        """Walk the fallback chain until a known prior is found."""
+        sex, age = group
+        for key in (
+            (sex,       age),
+            (sex,       "unknown"),
+            ("unknown", age),
+            ("unknown", "unknown"),
+        ):
+            if key in VTL_PRIOR_MM:
+                return VTL_PRIOR_MM[key]
+        return VTL_PRIOR_MM[("unknown", "unknown")]
 
-    def smoothed_group_vtl(self, group: str) -> float:
+    def smoothed_group_vtl(self, group: tuple) -> float:
         vals = self._group_vtls.get(group, [])
         n    = len(vals)
         if n == 0:
@@ -400,7 +432,7 @@ class VTLSmoother:
         alpha = n / (n + self.n0)
         return (1.0 - alpha) * self._prior(group) + alpha * float(np.mean(vals))
 
-    def smoothed_speaker_vtl(self, group: str, speaker: str) -> float:
+    def smoothed_speaker_vtl(self, group: tuple, speaker: str) -> float:
         vals      = self._speaker_vtls.get(speaker, [])
         n         = len(vals)
         group_vtl = self.smoothed_group_vtl(group)
@@ -409,7 +441,7 @@ class VTLSmoother:
         alpha = n / (n + self.n0)
         return (1.0 - alpha) * group_vtl + alpha * float(np.mean(vals))
 
-    def smooth_vtl(self, group: str, speaker: str, raw_vtl: float) -> float:
+    def smooth_vtl(self, group: tuple, speaker: str, raw_vtl: float) -> float:
         """literature -> group -> speaker -> sample blend."""
         spk_vtl = self.smoothed_speaker_vtl(group, speaker)
         if not np.isfinite(raw_vtl):
@@ -962,11 +994,16 @@ class OutlierConfig:
     def __post_init__(self):
         if self.f1_bounds_hz is None:
             self.f1_bounds_hz = {
-                "men":     (200.0,  950.0),
-                "women":   (200.0, 1100.0),
-                "boys":    (200.0, 1250.0),
-                "girls":   (200.0, 1250.0),
-                "_default":(200.0, 1100.0),
+                ("male",    "adult"):   (200.0,  950.0),
+                ("female",  "adult"):   (200.0, 1100.0),
+                ("male",    "child"):   (200.0, 1250.0),
+                ("female",  "child"):   (200.0, 1250.0),
+                # collapsed dimensions — use the more permissive ceiling
+                ("male",    "unknown"): (200.0, 1250.0),
+                ("female",  "unknown"): (200.0, 1250.0),
+                ("unknown", "adult"):   (200.0, 1100.0),
+                ("unknown", "child"):   (200.0, 1250.0),
+                ("unknown", "unknown"): (200.0, 1250.0),
             }
 
     # VTL: flag windows outside speaker_mean +/- vtl_std_threshold * speaker_std
@@ -1032,8 +1069,15 @@ def flag_outliers(
 
         # --- F1 bounds ---
         f1 = s["formant_hz"][:, 0]
-        f1_floor, f1_ceil = cfg.f1_bounds_hz.get(
-            group, cfg.f1_bounds_hz["_default"]
+        sex, age = group if isinstance(group, tuple) else ("unknown", "unknown")
+        f1_floor, f1_ceil = next(
+            (cfg.f1_bounds_hz[k] for k in (
+                (sex, age),
+                (sex, "unknown"),
+                ("unknown", age),
+                ("unknown", "unknown"),
+            ) if k in cfg.f1_bounds_hz),
+            (200.0, 1250.0),
         )
         flags["f1_bounds"] = (
             np.isfinite(f1) & ((f1 < f1_floor) | (f1 > f1_ceil))
@@ -1130,7 +1174,10 @@ def build_metadata(
             "vtl_std_mm":        float(np.std(arr))  if len(arr) else float("nan"),
             "n_samples":         len(grp_spks[grp]),
             "n_windows":         len(arr),
-            "vtl_literature_mm": VTL_PRIOR_MM.get(grp, VTL_PRIOR_MM["_default"]),
+            "vtl_literature_mm": VTL_PRIOR_MM.get(
+                grp if isinstance(grp, tuple) else ("unknown", "unknown"),
+                VTL_PRIOR_MM[("unknown", "unknown")],
+            ),
         }
 
     return speaker_meta, group_meta

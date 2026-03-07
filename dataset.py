@@ -43,6 +43,7 @@ from pathlib import Path
 
 import numpy as np
 import librosa
+from labeller import VALID_SEX, VALID_AGE
 
 
 # ---------------------------------------------------------------------------
@@ -247,7 +248,8 @@ def load_personal_dataset(
     speaker_config: "dict[str, dict] | None" = None,
     dialect: str = "unknown",
     source: str | None = None,
-    group: "str | dict[str, str] | None" = None,
+    sex: "str | dict[str, str]" = "unknown",
+    age: "str | dict[str, str]" = "unknown",
 ) -> list[dict]:
     """
     Load a personal vowel recording dataset from a directory tree.
@@ -273,28 +275,32 @@ def load_personal_dataset(
     dialect        : BCP-47-style dialect tag for all samples in this
                      dataset, e.g. "en-AU", "en-GB-RP". Default "unknown".
     source         : short dataset identifier. Defaults to root folder name.
-    group          : demographic group for VTL prior and outlier bounds lookup.
-                     Must be one of "men", "women", "boys", "girls" (matching
-                     labeller.VTL_PRIOR_MM keys).
-                     Pass a string to apply the same group to all speakers, or
-                     a dict mapping speaker name -> group for mixed datasets,
-                     e.g. {"Hannah": "women", "James": "men"}.
-                     Defaults to "women" if not specified.
+    sex            : biological sex for VTL prior lookup. One of
+                     "male"/"female"/"unknown" (from labeller.VALID_SEX).
+                     Pass a string to apply to all speakers, or a dict
+                     mapping speaker name -> sex for mixed datasets,
+                     e.g. {"Hannah": "female", "James": "male"}.
+                     Defaults to "unknown".
+    age            : age group for VTL prior lookup. One of
+                     "adult"/"child"/"unknown" (from labeller.VALID_AGE).
+                     Pass a string to apply to all speakers, or a dict
+                     mapping speaker name -> age for mixed datasets.
+                     Defaults to "unknown".
 
     Returns
     -------
     list of sample dicts with full pipeline schema:
         audio        : (T,) float32
-        label        : str  -- IPA vowel label from folder name
-        group        : str  -- demographic group for VTL prior lookup
-        speaker      : str  -- individual speaker identifier
-        dialect      : str  -- BCP-47 dialect tag
-        modality     : str  -- modality folder name, e.g. "Sung_M2"
-        source       : str  -- dataset identifier
+        label        : str          -- IPA vowel label from folder name
+        group        : (str, str)   -- (sex, age) tuple for VTL prior lookup
+        speaker      : str          -- individual speaker identifier
+        dialect      : str          -- BCP-47 dialect tag
+        modality     : str          -- modality folder name, e.g. "Sung_M2"
+        source       : str          -- dataset identifier
         formants     : (4,) float32 -- mean F1-F4 in Hz
         formants_std : (4,) float32 -- std  F1-F4 in Hz
         formants_raw : (T, 4) float32 -- per-frame F1-F4 in Hz
-        path         : str  -- source file path
+        path         : str          -- source file path
     """
     root   = Path(root)
     source = source or root.name
@@ -305,19 +311,27 @@ def load_personal_dataset(
     dataset          = []
     extensions_lower = tuple(e.lower() for e in extensions)
 
-    # Normalise group argument into a per-speaker lookup callable
-    _VALID_GROUPS = {"men", "women", "boys", "girls"}
-    if group is None:
-        def _group(spk: str) -> str: return "women"
-    elif isinstance(group, str):
-        if group not in _VALID_GROUPS:
-            raise ValueError(f"group={group!r} not recognised; expected one of {_VALID_GROUPS}")
-        def _group(spk: str) -> str: return group
-    else:
-        invalid = set(group.values()) - _VALID_GROUPS
-        if invalid:
-            raise ValueError(f"Unknown group(s) {invalid}; expected values from {_VALID_GROUPS}")
-        def _group(spk: str) -> str: return group.get(spk, "women")
+    def _resolve_dim(val, valid_set: frozenset, dim_name: str):
+        """Return a per-speaker callable for one (sex or age) dimension."""
+        if isinstance(val, str):
+            if val not in valid_set:
+                raise ValueError(
+                    f"{dim_name}={val!r} not recognised; expected one of {valid_set}"
+                )
+            return lambda spk: val
+        else:
+            invalid = set(val.values()) - valid_set
+            if invalid:
+                raise ValueError(
+                    f"Unknown {dim_name} value(s) {invalid}; expected from {valid_set}"
+                )
+            return lambda spk, _v=val: _v.get(spk, "unknown")
+
+    _sex = _resolve_dim(sex, VALID_SEX, "sex")
+    _age = _resolve_dim(age, VALID_AGE, "age")
+
+    def _group(spk: str) -> tuple:
+        return (_sex(spk), _age(spk))
 
     for speaker_dir in sorted(root.iterdir()):
         if not speaker_dir.is_dir():
