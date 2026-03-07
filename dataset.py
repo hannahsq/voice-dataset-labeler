@@ -247,6 +247,7 @@ def load_personal_dataset(
     speaker_config: "dict[str, dict] | None" = None,
     dialect: str = "unknown",
     source: str | None = None,
+    group: "str | dict[str, str] | None" = None,
 ) -> list[dict]:
     """
     Load a personal vowel recording dataset from a directory tree.
@@ -272,14 +273,21 @@ def load_personal_dataset(
     dialect        : BCP-47-style dialect tag for all samples in this
                      dataset, e.g. "en-AU", "en-GB-RP". Default "unknown".
     source         : short dataset identifier. Defaults to root folder name.
+    group          : demographic group for VTL prior and outlier bounds lookup.
+                     Must be one of "men", "women", "boys", "girls" (matching
+                     labeller.VTL_PRIOR_MM keys).
+                     Pass a string to apply the same group to all speakers, or
+                     a dict mapping speaker name -> group for mixed datasets,
+                     e.g. {"Hannah": "women", "James": "men"}.
+                     Defaults to "women" if not specified.
 
     Returns
     -------
     list of sample dicts with full pipeline schema:
         audio        : (T,) float32
         label        : str  -- IPA vowel label from folder name
-        group        : str  -- speaker name
-        speaker      : str  -- speaker name
+        group        : str  -- demographic group for VTL prior lookup
+        speaker      : str  -- individual speaker identifier
         dialect      : str  -- BCP-47 dialect tag
         modality     : str  -- modality folder name, e.g. "Sung_M2"
         source       : str  -- dataset identifier
@@ -296,6 +304,20 @@ def load_personal_dataset(
     speaker_config   = speaker_config or {}
     dataset          = []
     extensions_lower = tuple(e.lower() for e in extensions)
+
+    # Normalise group argument into a per-speaker lookup callable
+    _VALID_GROUPS = {"men", "women", "boys", "girls"}
+    if group is None:
+        def _group(spk: str) -> str: return "women"
+    elif isinstance(group, str):
+        if group not in _VALID_GROUPS:
+            raise ValueError(f"group={group!r} not recognised; expected one of {_VALID_GROUPS}")
+        def _group(spk: str) -> str: return group
+    else:
+        invalid = set(group.values()) - _VALID_GROUPS
+        if invalid:
+            raise ValueError(f"Unknown group(s) {invalid}; expected values from {_VALID_GROUPS}")
+        def _group(spk: str) -> str: return group.get(spk, "women")
 
     for speaker_dir in sorted(root.iterdir()):
         if not speaker_dir.is_dir():
@@ -334,7 +356,7 @@ def load_personal_dataset(
                         dataset.append({
                             "audio":        audio,
                             "label":        vowel,
-                            "group":        speaker,
+                            "group":        _group(speaker),
                             "speaker":      speaker,
                             "dialect":      dialect,
                             "modality":     modality,
