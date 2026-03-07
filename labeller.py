@@ -775,7 +775,7 @@ def label_dataset(
         speaker   = s.get("speaker", s.get("group", "unknown"))
         group     = s.get("group", speaker)
         final_vtl = smoother_second.smoothed_speaker_vtl(group, speaker)
-        frozen    = VTLSmoother(prior_strength=1e9, sample_alpha=0.0)
+        frozen    = VTLSmoother(prior_strength=cfg.vtl_prior_strength, sample_alpha=cfg.vtl_sample_alpha)
         frozen._speaker_vtls[speaker] = [final_vtl]
         frozen._group_vtls[group]     = [final_vtl]
         frozen_args.append((dict(s), cfg, frozen))
@@ -888,7 +888,7 @@ def label_incremental(
         speaker   = s.get("speaker", s.get("group", "unknown"))
         group     = s.get("group", speaker)
         final_vtl = smoother.smoothed_speaker_vtl(group, speaker)
-        frozen    = VTLSmoother(prior_strength=1e9, sample_alpha=0.0)
+        frozen    = VTLSmoother(prior_strength=cfg.vtl_prior_strength, sample_alpha=cfg.vtl_sample_alpha)
         frozen._speaker_vtls[speaker] = [final_vtl]
         frozen._group_vtls[group]     = [final_vtl]
         frozen_args.append((dict(s), cfg, frozen))
