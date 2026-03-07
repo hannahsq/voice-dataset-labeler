@@ -746,29 +746,36 @@ def probe_raw_formants(
     samples: list[dict],
     cfg: Optional[LabellerConfig] = None,
     sr: int = 16000,
-    n_per_group: int = 1,
     verbose: bool = True,
 ) -> list[dict]:
     """
-    Run a single raw extraction pass on one sample per group, with no
-    multi-pass smoothing.  The VTL prior is the bare literature value for
-    each group — no data-driven blending is applied.
+    Run a single raw extraction pass on one sample per group per vowel,
+    with no multi-pass smoothing.  The VTL prior is the bare literature
+    value for each group — no data-driven blending is applied.
+
+    Selection rules
+    ---------------
+    - Only vowels present in every group are included (intersection).
+      Falls back to the union with a warning if the intersection is empty.
+    - One sample is chosen per (group, vowel) pair.
+    - No speaker appears more than once across the entire probe set.
+    - Where a vowel cannot be filled for a group without reusing a speaker,
+      it is skipped and a note is printed.
 
     Intended for sanity checking: compare returned formant_hz / vtl_sample_mm
     against your expectations before committing to a full label_dataset() run.
 
     Parameters
     ----------
-    samples     : same list passed to label_dataset()
-    cfg         : LabellerConfig (uses defaults if None)
-    sr          : fallback sample rate
-    n_per_group : how many samples to probe per group (default 1)
-    verbose     : print which samples are being probed
+    samples : same list passed to label_dataset()
+    cfg     : LabellerConfig (uses defaults if None)
+    sr      : fallback sample rate
+    verbose : print selection summary
 
     Returns
     -------
-    List of transposed sample dicts (same schema as label_dataset() output),
-    one per probed sample.  No smoothing, no multi-pass VTL correction.
+    List of transposed sample dicts (same schema as label_dataset() output).
+    No smoothing, no multi-pass VTL correction.
     """
     if cfg is None:
         cfg = LabellerConfig()
@@ -776,18 +783,59 @@ def probe_raw_formants(
     for s in samples:
         s.setdefault("sr", sr)
 
-    # Select n_per_group samples per group, preferring earlier ones
-    selected: list[dict] = []
-    counts: dict[str, int] = defaultdict(int)
+    # --- Selection: no duplicate speakers or vowels; same vowel set per group ---
+
+    # Pass 1: find which vowels are available in every group
+    vowels_by_group: dict[str, set[str]] = defaultdict(set)
     for s in samples:
-        group = s.get("group", s.get("speaker", "unknown"))
-        if counts[group] < n_per_group:
-            selected.append(s)
-            counts[group] += 1
+        g = s.get("group", s.get("speaker", "unknown"))
+        vowels_by_group[g].add(s.get("label", ""))
+
+    shared_vowels: set[str] = set.intersection(*vowels_by_group.values()) \
+        if vowels_by_group else set()
+
+    if not shared_vowels:
+        # Fall back to the union if no vowel appears in every group
+        shared_vowels = set.union(*vowels_by_group.values()) if vowels_by_group else set()
+        if verbose:
+            print("[probe_raw_formants] WARNING: no vowels common to all groups; "
+                  "using union instead")
+
+    # Pass 2: for each group pick one sample per shared vowel,
+    # never reusing the same speaker
+    group_selections: dict[str, dict[str, dict]] = defaultdict(dict)  # group -> vowel -> sample
+    used_speakers: set[str] = set()
+
+    for s in samples:
+        g       = s.get("group", s.get("speaker", "unknown"))
+        vowel   = s.get("label", "")
+        speaker = s.get("speaker", s.get("group", "unknown"))
+
+        if vowel not in shared_vowels:
+            continue
+        if vowel in group_selections[g]:          # vowel already filled for this group
+            continue
+        if speaker in used_speakers:              # speaker already used in any group
+            continue
+
+        group_selections[g][vowel] = s
+        used_speakers.add(speaker)
+
+    selected = [s for g_sels in group_selections.values() for s in g_sels.values()]
 
     if verbose:
-        breakdown = ", ".join(f"{g}={n}" for g, n in sorted(counts.items()))
+        breakdown = ", ".join(
+            f"{g}={len(sels)} vowels" for g, sels in sorted(group_selections.items())
+        )
+        missing = {
+            g: shared_vowels - set(group_selections[g].keys())
+            for g in vowels_by_group
+            if shared_vowels - set(group_selections[g].keys())
+        }
         print(f"[probe_raw_formants] {len(selected)} samples ({breakdown})")
+        if missing:
+            print(f"  NOTE: some vowels could not be filled without reusing a speaker: "
+                  + ", ".join(f"{g}:{v}" for g, vs in missing.items() for v in vs))
 
     # Build a literature-only smoother — alpha=0 at every level means the
     # smooth_vtl() call returns the literature prior unchanged for any sample
