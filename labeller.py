@@ -123,8 +123,8 @@ class LabellerConfig:
     hop_ms:                 float = 5.0
     min_f0_hz:              float = 50.0
     max_f0_hz:              float = 600.0
-    n_praat_formants:       int   = N_FORMANTS
     max_formant_hz:         float = 5500.0
+    n_praat_formants:       int   = N_FORMANTS
     vtl_prior_strength:     float = 10.0    # n0 for uncertainty-weighted blend
     vtl_sample_alpha:       float = 0.30    # fixed sample-level blend fraction
     voicing_threshold_dbfs: float = -40.0
@@ -954,23 +954,32 @@ def probe_full(
 
 @dataclass
 class OutlierConfig:
-    # F1 physiological bounds — group-specific ceilings applied where known
-    f1_floor_hz:          float      = 200.0
-    f1_ceil_adult_hz:     float      = 900.0    # men / women
-    f1_ceil_child_hz:     float      = 1050.0   # boys / girls
-    _child_groups:        frozenset  = frozenset({"boys", "girls"})
+    # Per-group F1 bounds (Hz).  Groups not listed fall back to the
+    # _default entry.  Ceilings are set generously to cover the open
+    # vowels (/a/, /ɑ/) while still catching tracker misfires.
+    f1_bounds_hz: dict = None
+
+    def __post_init__(self):
+        if self.f1_bounds_hz is None:
+            self.f1_bounds_hz = {
+                "men":     (200.0,  950.0),
+                "women":   (200.0, 1100.0),
+                "boys":    (200.0, 1250.0),
+                "girls":   (200.0, 1250.0),
+                "_default":(200.0, 1100.0),
+            }
 
     # VTL: flag windows outside speaker_mean +/- vtl_std_threshold * speaker_std
-    vtl_std_threshold:    float      = 3.0
+    vtl_std_threshold: float = 3.0
 
     # Formant gap: flag windows where any adjacent assigned formant pair
     # exceeds gap_threshold * expected_delta_F (suggests a missed formant
     # slipped through the assignment step)
-    formant_gap_threshold: float     = 2.2
+    formant_gap_threshold: float = 2.2
 
     # Flag unvoiced windows (NaN f0) — not "bad" data but often useful to
     # mask separately at training time
-    flag_unvoiced:        bool       = True
+    flag_unvoiced: bool = True
 
 
 def flag_outliers(
@@ -1022,12 +1031,12 @@ def flag_outliers(
         flags: dict[str, np.ndarray] = {}
 
         # --- F1 bounds ---
-        f1      = s["formant_hz"][:, 0]
-        f1_ceil = (cfg.f1_ceil_child_hz
-                   if group in cfg._child_groups
-                   else cfg.f1_ceil_adult_hz)
+        f1 = s["formant_hz"][:, 0]
+        f1_floor, f1_ceil = cfg.f1_bounds_hz.get(
+            group, cfg.f1_bounds_hz["_default"]
+        )
         flags["f1_bounds"] = (
-            np.isfinite(f1) & ((f1 < cfg.f1_floor_hz) | (f1 > f1_ceil))
+            np.isfinite(f1) & ((f1 < f1_floor) | (f1 > f1_ceil))
         )
 
         # --- VTL range ---
