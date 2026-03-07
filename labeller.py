@@ -110,7 +110,7 @@ VTL_PRIOR_MM: dict[str, float] = {
 
 FORMANT_MATCH_TOLERANCE = 0.45   # +/- fraction of delta-F for pole assignment
 
-N_FORMANTS = 5
+N_FORMANTS = 6
 
 
 # ---------------------------------------------------------------------------
@@ -124,7 +124,7 @@ class LabellerConfig:
     min_f0_hz:              float = 50.0
     max_f0_hz:              float = 600.0
     max_formant_hz:         float = 9000.0
-    n_praat_formants:       int   = N_FORMANTS + 2
+    n_praat_formants:       int   = N_FORMANTS + 1
     vtl_prior_strength:     float = 10.0    # n0 for uncertainty-weighted blend
     vtl_sample_alpha:       float = 0.30    # fixed sample-level blend fraction
     voicing_threshold_dbfs: float = -40.0
@@ -855,9 +855,78 @@ def probe_raw_formants(
     return results
 
 
-# ---------------------------------------------------------------------------
-# Metadata
-# ---------------------------------------------------------------------------
+def probe_full(
+    samples: list[dict],
+    cfg: Optional[LabellerConfig] = None,
+    sr: int = 16000,
+    speakers_per_group: int = 2,
+    verbose: bool = True,
+) -> list[dict]:
+    """
+    Run the full three-pass label_dataset() pipeline on a small representative
+    subset: up to ``speakers_per_group`` speakers per group, all vowels.
+
+    Selection rules
+    ---------------
+    - Speakers are chosen greedily in dataset order.
+    - No speaker appears in more than one group's quota (global uniqueness).
+    - All samples belonging to the selected speakers are included, so the
+      VTL smoother sees the same multi-vowel context as a real run.
+
+    Parameters
+    ----------
+    samples            : same list passed to label_dataset()
+    cfg                : LabellerConfig (uses defaults if None)
+    sr                 : fallback sample rate
+    speakers_per_group : how many speakers to include per group (default 2)
+    verbose            : passed through to label_dataset()
+
+    Returns
+    -------
+    List of transposed sample dicts (same schema as label_dataset() output),
+    one per selected sample.
+    """
+    if cfg is None:
+        cfg = LabellerConfig()
+
+    # --- Select speakers ---
+    group_speakers: dict[str, list[str]] = defaultdict(list)
+    used_speakers:  set[str]             = set()
+
+    for s in samples:
+        group   = s.get("group", s.get("speaker", "unknown"))
+        speaker = s.get("speaker", group)
+        if speaker in used_speakers:
+            continue
+        if len(group_speakers[group]) < speakers_per_group:
+            group_speakers[group].append(speaker)
+            used_speakers.add(speaker)
+
+    if verbose:
+        breakdown = ", ".join(
+            f"{g}={len(spks)} speakers ({', '.join(spks)})"
+            for g, spks in sorted(group_speakers.items())
+        )
+        print(f"[probe_full] Selected: {breakdown}")
+
+    # --- Collect all samples for selected speakers ---
+    selected = [
+        s for s in samples
+        if s.get("speaker", s.get("group", "unknown")) in used_speakers
+    ]
+
+    if verbose:
+        vowels_by_spk = defaultdict(set)
+        for s in selected:
+            vowels_by_spk[s.get("speaker", "?")].add(s.get("label", "?"))
+        for spk, vowels in sorted(vowels_by_spk.items()):
+            print(f"  {spk}: {len(vowels)} vowels ({', '.join(sorted(vowels))})")
+        print(f"[probe_full] {len(selected)} samples total — running full pipeline...")
+
+    return label_dataset(selected, cfg=cfg, sr=sr, verbose=verbose)
+
+
+
 
 def build_metadata(
     labelled: list[dict],
