@@ -43,7 +43,7 @@ from pathlib import Path
 
 import numpy as np
 import librosa
-from labeller import VALID_SEX, VALID_AGE
+from labeller import Modality, SpeakerMeta, VALID_VTL_CLASS, VALID_AGE
 
 
 # ---------------------------------------------------------------------------
@@ -245,11 +245,9 @@ def load_personal_dataset(
     root: str,
     sr: int = 16000,
     extensions: tuple[str, ...] = (".flac", ".wav", ".mp3"),
-    speaker_config: "dict[str, dict] | None" = None,
+    speaker_meta: "dict[str, SpeakerMeta] | None" = None,
     dialect: str = "unknown",
     source: str | None = None,
-    sex: "str | dict[str, str]" = "unknown",
-    age: "str | dict[str, str]" = "unknown",
 ) -> list[dict]:
     """
     Load a personal vowel recording dataset from a directory tree.
@@ -263,80 +261,52 @@ def load_personal_dataset(
                     *.flac
 
     The vowel folder name is used as the IPA label directly.
+    The modality folder name is parsed into a Modality object via
+    Modality.from_path() with coercion defaults (register=M1, direction=exhale).
 
     Parameters
     ----------
-    root           : path to the root recordings directory
-    sr             : target sample rate for audio loading
-    extensions     : audio file extensions to include
-    speaker_config : optional dict mapping speaker name to kwargs for
-                     estimate_formants(), e.g.
-                     {"Hannah": {"max_formant_hz": 5500}}
-    dialect        : BCP-47-style dialect tag for all samples in this
-                     dataset, e.g. "en-AU", "en-GB-RP". Default "unknown".
-    source         : short dataset identifier. Defaults to root folder name.
-    sex            : biological sex for VTL prior lookup. One of
-                     "male"/"female"/"unknown" (from labeller.VALID_SEX).
-                     Pass a string to apply to all speakers, or a dict
-                     mapping speaker name -> sex for mixed datasets,
-                     e.g. {"Hannah": "female", "James": "male"}.
-                     Defaults to "unknown".
-    age            : age group for VTL prior lookup. One of
-                     "adult"/"child"/"unknown" (from labeller.VALID_AGE).
-                     Pass a string to apply to all speakers, or a dict
-                     mapping speaker name -> age for mixed datasets.
-                     Defaults to "unknown".
+    root         : path to the root recordings directory
+    sr           : target sample rate for audio loading
+    extensions   : audio file extensions to include
+    speaker_meta : dict mapping speaker name to SpeakerMeta, e.g.
+                   {"Hannah": SpeakerMeta(vtl_class="large", gender="woman",
+                                          age=28, tags={"trans"})}
+                   Speakers not listed receive a default SpeakerMeta().
+    dialect      : BCP-47-style dialect tag, e.g. "en-AU". Default "unknown".
+    source       : short dataset identifier. Defaults to root folder name.
 
     Returns
     -------
     list of sample dicts with full pipeline schema:
         audio        : (T,) float32
-        label        : str          -- IPA vowel label from folder name
-        group        : (str, str)   -- (sex, age) tuple for VTL prior lookup
-        speaker      : str          -- individual speaker identifier
-        dialect      : str          -- BCP-47 dialect tag
-        modality     : str          -- modality folder name, e.g. "Sung_M2"
-        source       : str          -- dataset identifier
-        formants     : (4,) float32 -- mean F1-F4 in Hz
-        formants_std : (4,) float32 -- std  F1-F4 in Hz
+        label        : str           -- IPA vowel label from folder name
+        speaker      : str           -- individual speaker identifier
+        speaker_meta : SpeakerMeta   -- per-speaker metadata
+        modality     : Modality      -- parsed modality object
+        dialect      : str           -- BCP-47 dialect tag
+        source       : str           -- dataset identifier
+        formants     : (4,) float32  -- mean F1-F4 in Hz
+        formants_std : (4,) float32  -- std  F1-F4 in Hz
         formants_raw : (T, 4) float32 -- per-frame F1-F4 in Hz
-        path         : str          -- source file path
+        path         : str           -- source file path
     """
-    root   = Path(root)
-    source = source or root.name
+    root         = Path(root)
+    source       = source or root.name
+    speaker_meta = speaker_meta or {}
+
     if not root.is_dir():
         raise ValueError(f"Root directory not found: {root}")
 
-    speaker_config   = speaker_config or {}
     dataset          = []
     extensions_lower = tuple(e.lower() for e in extensions)
-
-    def _resolve_dim(val, valid_set: frozenset, dim_name: str):
-        """Return a per-speaker callable for one (sex or age) dimension."""
-        if isinstance(val, str):
-            if val not in valid_set:
-                raise ValueError(
-                    f"{dim_name}={val!r} not recognised; expected one of {valid_set}"
-                )
-            return lambda spk: val
-        else:
-            invalid = set(val.values()) - valid_set
-            if invalid:
-                raise ValueError(
-                    f"Unknown {dim_name} value(s) {invalid}; expected from {valid_set}"
-                )
-            return lambda spk, _v=val: _v.get(spk, "unknown")
-
-    _sex = _resolve_dim(sex, VALID_SEX, "sex")
-    _age = _resolve_dim(age, VALID_AGE, "age")
-
-    def _group(spk: str) -> tuple:
-        return (_sex(spk), _age(spk))
+    _default_meta    = SpeakerMeta()
 
     for speaker_dir in sorted(root.iterdir()):
         if not speaker_dir.is_dir():
             continue
         speaker = speaker_dir.name
+        meta    = speaker_meta.get(speaker, _default_meta)
 
         for vowel_dir in sorted(speaker_dir.iterdir()):
             if not vowel_dir.is_dir():
@@ -346,13 +316,12 @@ def load_personal_dataset(
             for modality_dir in sorted(vowel_dir.iterdir()):
                 if not modality_dir.is_dir():
                     continue
-                modality = modality_dir.name
+                modality = Modality.from_path(modality_dir.name)
 
-                audio_files    = sorted(
+                audio_files = sorted(
                     p for p in modality_dir.iterdir()
                     if p.suffix.lower() in extensions_lower
                 )
-                formant_kwargs = speaker_config.get(speaker, {})
 
                 for audio_path in audio_files:
                     try:
@@ -363,17 +332,15 @@ def load_personal_dataset(
                         if peak > 1e-6:
                             audio = audio / peak
 
-                        formants_raw = estimate_formants(
-                            audio, sr=sr, **formant_kwargs
-                        )
+                        formants_raw = estimate_formants(audio, sr=sr)
 
                         dataset.append({
                             "audio":        audio,
                             "label":        vowel,
-                            "group":        _group(speaker),
                             "speaker":      speaker,
-                            "dialect":      dialect,
+                            "speaker_meta": meta,
                             "modality":     modality,
+                            "dialect":      dialect,
                             "source":       source,
                             "formants":     formants_raw.mean(axis=0),
                             "formants_std": formants_raw.std(axis=0),

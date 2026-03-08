@@ -87,6 +87,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Optional
 
+import re
 import numpy as np
 import parselmouth
 from parselmouth.praat import call
@@ -99,31 +100,163 @@ import librosa
 
 SPEED_OF_SOUND_MM_S = 350_000.0   # mm/s — warm, humid vocal tract interior
 
-# Valid values for the sex and age dimensions of the group tuple.
-# Exported so dataset loaders can validate against the same constants.
-VALID_SEX: frozenset = frozenset({"male", "female", "unknown"})
-VALID_AGE: frozenset = frozenset({"adult", "child",  "unknown"})
+# VTL size classes — used for smoothing prior only, decoupled from demographics.
+# Boundaries (mm):  small <135 | medium 135–162 | large >162
+# Based on Fitch & Giedd (1999) / Story (2005); roughly child / women / men.
+VALID_VTL_CLASS: frozenset = frozenset({"small", "medium", "large", "unknown"})
 
-# Literature VTL priors (mm) keyed by (sex, age) tuples.
-# Fitch & Giedd (1999) / Story (2005).
-# Fallback hierarchy (most to least specific):
-#   (sex, age) -> (sex, "unknown") -> ("unknown", age) -> ("unknown", "unknown")
-VTL_PRIOR_MM: dict = {
-    ("male",    "adult"):   174.0,
-    ("female",  "adult"):   148.0,
-    ("male",    "child"):   128.0,
-    ("female",  "child"):   123.0,
-    # collapsed dimensions
-    ("male",    "unknown"): 151.0,   # mean of male adult + child
-    ("female",  "unknown"): 135.5,   # mean of female adult + child
-    ("unknown", "adult"):   161.0,   # mean of male + female adult
-    ("unknown", "child"):   125.5,   # mean of male + female child
-    ("unknown", "unknown"): 148.0,   # whole-dataset mean (literature)
+VTL_PRIOR_MM: dict[str, float] = {
+    "small":   128.0,   # representative: children
+    "medium":  148.0,   # representative: adult women
+    "large":   174.0,   # representative: adult men
+    "unknown": 148.0,   # conservative fallback
 }
+
+# Age labels — used in SpeakerMeta; coerced from numeric age at construction.
+# Thresholds: <12 child | 12–15 teen | >=16 adult
+VALID_AGE: frozenset = frozenset({"adult", "teen", "child", "unknown"})
+_AGE_CHILD_MAX  = 12
+_AGE_TEEN_MAX   = 16
+
+# Modality labels
+VALID_MODALITY:  frozenset = frozenset({"spoken", "sung"})
+VALID_DIRECTION: frozenset = frozenset({"exhale", "inhale"})
 
 FORMANT_MATCH_TOLERANCE = 0.45   # +/- fraction of delta-F for pole assignment
 
-N_FORMANTS = 5
+N_FORMANTS = 7
+
+
+# ---------------------------------------------------------------------------
+# Modality and SpeakerMeta
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Modality:
+    """
+    Structured recording modality parsed from folder names.
+
+    Folder name format:  Modality[_Register[_Direction[_Tag1[_Tag2...]]]]
+    Examples:
+        Spoken                   -> Modality("spoken", "M1", "exhale", frozenset())
+        Sung_M2                  -> Modality("sung",   "M2", "exhale", frozenset())
+        Sung_M2_Inhale           -> Modality("sung",   "M2", "inhale", frozenset())
+        Sung_M3_Inhale_Pressed   -> Modality("sung",   "M3", "inhale", frozenset({"pressed"}))
+        Sung_M1_Exhale_Pressed_Breathy
+                                 -> Modality("sung",   "M1", "exhale", frozenset({"pressed","breathy"}))
+    """
+    modality:  str       # "spoken" | "sung"
+    register:  str       # "M0", "M1", "M2", ... — voice register
+    direction: str       # "exhale" | "inhale"
+    tags:      frozenset # arbitrary lowercase annotation tags
+
+    def __post_init__(self):
+        if self.modality not in VALID_MODALITY:
+            raise ValueError(f"modality={self.modality!r} not in {VALID_MODALITY}")
+        if self.direction not in VALID_DIRECTION:
+            raise ValueError(f"direction={self.direction!r} not in {VALID_DIRECTION}")
+        object.__setattr__(self, "tags", frozenset(t.lower() for t in self.tags))
+
+    @classmethod
+    def from_path(cls, folder_name: str) -> "Modality":
+        """
+        Parse a modality folder name into a Modality instance with coercion.
+        Unrecognised first token defaults to "spoken".
+        Register defaults to "M1", direction to "exhale", tags to empty.
+        """
+        parts = folder_name.split("_")
+        modality  = parts[0].lower()
+        if modality not in VALID_MODALITY:
+            import warnings
+            warnings.warn(
+                f"Unrecognised modality {parts[0]!r} in folder {folder_name!r}; "
+                f"defaulting to 'spoken'.",
+                stacklevel=2,
+            )
+            modality = "spoken"
+
+        register  = "M1"
+        direction = "exhale"
+        tags      = []
+
+        for part in parts[1:]:
+            pl = part.lower()
+            if re.match(r"^m\d+$", pl):
+                register = part.upper()
+            elif pl in VALID_DIRECTION:
+                direction = pl
+            else:
+                tags.append(pl)
+
+        return cls(modality=modality, register=register,
+                   direction=direction, tags=frozenset(tags))
+
+    def to_str(self) -> str:
+        """Round-trip back to a canonical folder-name style string."""
+        parts = [self.modality.capitalize(), self.register,
+                 self.direction.capitalize()]
+        parts += sorted(self.tags)
+        return "_".join(parts)
+
+
+@dataclass
+class SpeakerMeta:
+    """
+    Per-speaker metadata used for VTL smoothing and demographic bookkeeping.
+
+    vtl_class and vtl_prior_mm
+    --------------------------
+    vtl_class drives the group-level VTL prior (see VTL_PRIOR_MM).
+    If vtl_prior_mm is set explicitly, the group-level blend is skipped
+    entirely and the numeric value seeds the speaker-level smoother directly.
+    Per-sample alpha still applies in both cases.
+
+    age coercion
+    ------------
+    Numeric age is coerced to a label using thresholds defined in _AGE_CHILD_MAX
+    and _AGE_TEEN_MAX:  <12 -> "child" | 12–15 -> "teen" | >=16 -> "adult".
+
+    vtl_class coercion
+    ------------------
+    Numeric vtl_class (mm) is stored as vtl_prior_mm and vtl_class is set to
+    the nearest named class; the numeric value takes precedence for smoothing.
+    """
+    vtl_class:    str         = "unknown"  # "small"|"medium"|"large"|"unknown"
+    vtl_prior_mm: float|None  = None       # explicit mm override
+    gender:       str         = "unknown"  # free-form: "woman","man","non-binary",...
+    age:          str         = "unknown"  # "adult"|"teen"|"child"|"unknown"
+    tags:         frozenset   = frozenset()# {"trans","voice_training","vfs",...}
+
+    def __post_init__(self):
+        # Coerce numeric age
+        age = self.age
+        if isinstance(age, (int, float)):
+            if age < _AGE_CHILD_MAX:
+                age = "child"
+            elif age < _AGE_TEEN_MAX:
+                age = "teen"
+            else:
+                age = "adult"
+            object.__setattr__(self, "age", age)
+        if self.age not in VALID_AGE:
+            raise ValueError(f"age={self.age!r} not in {VALID_AGE}")
+
+        # Coerce numeric vtl_class
+        vtl_class = self.vtl_class
+        if isinstance(vtl_class, (int, float)):
+            mm = float(vtl_class)
+            object.__setattr__(self, "vtl_prior_mm", mm)
+            if mm < 135.0:
+                vtl_class = "small"
+            elif mm < 162.0:
+                vtl_class = "medium"
+            else:
+                vtl_class = "large"
+            object.__setattr__(self, "vtl_class", vtl_class)
+        if self.vtl_class not in VALID_VTL_CLASS:
+            raise ValueError(f"vtl_class={self.vtl_class!r} not in {VALID_VTL_CLASS}")
+
+        object.__setattr__(self, "tags", frozenset(self.tags))
 
 
 # ---------------------------------------------------------------------------
@@ -137,7 +270,7 @@ class LabellerConfig:
     min_f0_hz:              float = 50.0
     max_f0_hz:              float = 600.0
     max_formant_hz:         float = 5500.0
-    n_praat_formants:       int   = N_FORMANTS
+    n_praat_formants:       int   = N_FORMANTS + 2
     vtl_prior_strength:     float = 10.0    # n0 for uncertainty-weighted blend
     vtl_sample_alpha:       float = 0.30    # fixed sample-level blend fraction [0, 0.9]
     voicing_threshold_dbfs: float = -40.0
@@ -397,50 +530,55 @@ class VTLSmoother:
     Blends group/speaker VTL statistics with the literature prior using
     uncertainty-weighted alphas:  alpha = n / (n + n0).
 
-    group is a (sex, age) tuple, e.g. ("female", "adult").
-    Unknown dimensions are represented as "unknown":
-        ("male",    "unknown")  -- sex known, age unknown
-        ("unknown", "adult")    -- age known, sex unknown
-        ("unknown", "unknown")  -- neither known
+    group is a vtl_class string: "small" | "medium" | "large" | "unknown".
 
-    Prior fallback hierarchy (most to least specific):
-        (sex, age) -> (sex, "unknown") -> ("unknown", age) -> ("unknown", "unknown")
+    If a SpeakerMeta with vtl_prior_mm set is registered via
+    register_speaker_override(), the group-level blend is skipped for that
+    speaker and the explicit mm value seeds the speaker level directly.
+    Per-sample alpha still applies.
     """
 
     def __init__(self, prior_strength: float = 10.0, sample_alpha: float = 0.30):
-        self.n0           = prior_strength
-        self.sample_alpha = sample_alpha
-        self._group_vtls:   dict[tuple, list[float]] = {}
-        self._speaker_vtls: dict[str,   list[float]] = {}
+        self.n0                    = prior_strength
+        self.sample_alpha          = sample_alpha
+        self._group_vtls:   dict[str, list[float]] = {}
+        self._speaker_vtls: dict[str, list[float]] = {}
+        self._speaker_override_mm: dict[str, float] = {}  # vtl_prior_mm overrides
 
-    def update(self, group: tuple, speaker: str, vtl_mm: float) -> None:
+    def register_speaker_override(self, speaker: str, vtl_prior_mm: float) -> None:
+        """Register an explicit mm VTL for a speaker, bypassing group smoothing."""
+        self._speaker_override_mm[speaker] = vtl_prior_mm
+        # Also seed the speaker list so downstream alpha sees data
+        self._speaker_vtls.setdefault(speaker, []).append(vtl_prior_mm)
+
+    def update(self, group: str, speaker: str, vtl_mm: float) -> None:
         if not np.isfinite(vtl_mm):
             return
         self._group_vtls.setdefault(group, []).append(vtl_mm)
         self._speaker_vtls.setdefault(speaker, []).append(vtl_mm)
 
-    def _prior(self, group: tuple) -> float:
-        """Walk the fallback chain until a known prior is found."""
-        sex, age = group
-        for key in (
-            (sex,       age),
-            (sex,       "unknown"),
-            ("unknown", age),
-            ("unknown", "unknown"),
-        ):
-            if key in VTL_PRIOR_MM:
-                return VTL_PRIOR_MM[key]
-        return VTL_PRIOR_MM[("unknown", "unknown")]
+    def _prior(self, group: str) -> float:
+        return VTL_PRIOR_MM.get(group, VTL_PRIOR_MM["unknown"])
 
-    def smoothed_group_vtl(self, group: tuple) -> float:
-        vals = self._group_vtls.get(group, [])
-        n    = len(vals)
+    def smoothed_group_vtl(self, group: str) -> float:
+        vals  = self._group_vtls.get(group, [])
+        n     = len(vals)
         if n == 0:
             return self._prior(group)
         alpha = n / (n + self.n0)
         return (1.0 - alpha) * self._prior(group) + alpha * float(np.mean(vals))
 
-    def smoothed_speaker_vtl(self, group: tuple, speaker: str) -> float:
+    def smoothed_speaker_vtl(self, group: str, speaker: str) -> float:
+        # If an explicit override is registered, skip group-level blend entirely
+        if speaker in self._speaker_override_mm:
+            override  = self._speaker_override_mm[speaker]
+            spk_vals  = self._speaker_vtls.get(speaker, [])
+            n         = len(spk_vals)
+            if n <= 1:
+                return override
+            alpha = n / (n + self.n0)
+            return (1.0 - alpha) * override + alpha * float(np.mean(spk_vals))
+
         vals      = self._speaker_vtls.get(speaker, [])
         n         = len(vals)
         group_vtl = self.smoothed_group_vtl(group)
@@ -449,7 +587,7 @@ class VTLSmoother:
         alpha = n / (n + self.n0)
         return (1.0 - alpha) * group_vtl + alpha * float(np.mean(vals))
 
-    def smooth_vtl(self, group: tuple, speaker: str, raw_vtl: float) -> float:
+    def smooth_vtl(self, group: str, speaker: str, raw_vtl: float) -> float:
         """literature -> group -> speaker -> sample blend."""
         spk_vtl = self.smoothed_speaker_vtl(group, speaker)
         if not np.isfinite(raw_vtl):
@@ -476,9 +614,14 @@ def _extract_sample(
     """
     audio    = sample["audio"].astype(np.float32)
     sr       = sample.get("sr", 16000)
-    speaker  = sample.get("speaker", sample.get("group", "unknown"))
-    group    = sample.get("group", speaker)
-    modality = sample.get("modality", "spoken")
+    speaker  = sample.get("speaker", "unknown")
+    # group is a vtl_class string; speaker_meta.vtl_class is the canonical source
+    meta     = sample.get("speaker_meta")
+    group    = (meta.vtl_class if isinstance(meta, SpeakerMeta)
+                else sample.get("group", "unknown"))
+    # modality: accept Modality object or plain string
+    _mod     = sample.get("modality", "spoken")
+    modality = _mod.modality if isinstance(_mod, Modality) else str(_mod)
 
     win_ms      = max(cfg.win_ms, 3000.0 / cfg.min_f0_hz)
     win_s       = win_ms / 1000.0
@@ -591,8 +734,10 @@ def _worker_seed_vtl(
     """
     s, cfg   = args
     audio    = s["audio"].astype(np.float32)
-    speaker  = s.get("speaker", s.get("group", "unknown"))
-    group    = s.get("group", speaker)
+    speaker  = s.get("speaker", "unknown")
+    meta     = s.get("speaker_meta")
+    group    = (meta.vtl_class if isinstance(meta, SpeakerMeta)
+                else s.get("group", "unknown"))
     sr       = s.get("sr", 16000)
     win_s    = max(cfg.win_ms, 3000.0 / cfg.min_f0_hz) / 1000.0
     duration = len(audio) / sr
@@ -780,12 +925,16 @@ def label_dataset(
 
     frozen_args = []
     for s in samples:
-        speaker   = s.get("speaker", s.get("group", "unknown"))
-        group     = s.get("group", speaker)
+        speaker   = s.get("speaker", "unknown")
+        meta      = s.get("speaker_meta")
+        group     = (meta.vtl_class if isinstance(meta, SpeakerMeta)
+                     else s.get("group", "unknown"))
         final_vtl = smoother_second.smoothed_speaker_vtl(group, speaker)
-        frozen    = VTLSmoother(prior_strength=cfg.vtl_prior_strength, sample_alpha=cfg.vtl_sample_alpha)
+        frozen    = VTLSmoother(prior_strength=1e9, sample_alpha=cfg.vtl_sample_alpha)
         frozen._speaker_vtls[speaker] = [final_vtl]
         frozen._group_vtls[group]     = [final_vtl]
+        if meta and isinstance(meta, SpeakerMeta) and meta.vtl_prior_mm is not None:
+            frozen.register_speaker_override(speaker, meta.vtl_prior_mm)
         frozen_args.append((dict(s), cfg, frozen))
 
     pass2 = _parallel_map(frozen_args, n_workers, verbose, "pass2")
@@ -868,7 +1017,7 @@ def label_incremental(
     """
     if cfg is None:
         cfg = LabellerConfig()
-    print(cfg)
+
     for s in new_samples:
         s.setdefault("sr", sr)
 
@@ -884,10 +1033,11 @@ def label_incremental(
     if verbose:
         groups = {}
         for s in existing:
-            groups[s["group"]] = groups.get(s["group"], 0) + 1
-        breakdown = ", ".join(f"{g}={n}" for g, n in sorted(
-            groups.items(), key=lambda x: str(x[0])
-        ))
+            meta = s.get("speaker_meta")
+            g    = (meta.vtl_class if isinstance(meta, SpeakerMeta)
+                    else s.get("group", "unknown"))
+            groups[g] = groups.get(g, 0) + 1
+        breakdown = ", ".join(f"{g}={n}" for g, n in sorted(groups.items()))
         print(f"[label_incremental] Smoother seeded from existing: {breakdown}")
 
     # Seed per-speaker VTL for new speakers from their own audio before the
@@ -910,9 +1060,11 @@ def label_incremental(
     if verbose:
         new_speakers = {s.get("speaker", "unknown") for s in new_samples}
         for spk in sorted(new_speakers):
-            grp = next((s["group"] for s in new_samples
-                        if s.get("speaker") == spk), ("unknown","unknown"))
-            vtl = smoother.smoothed_speaker_vtl(grp, spk)
+            s_   = next((s for s in new_samples if s.get("speaker") == spk), {})
+            meta = s_.get("speaker_meta")
+            grp  = (meta.vtl_class if isinstance(meta, SpeakerMeta)
+                    else s_.get("group", "unknown"))
+            vtl  = smoother.smoothed_speaker_vtl(grp, spk)
             print(f"  seeded {spk} ({grp}): VTL={vtl:.1f}mm")
 
     # Single pass with frozen per-speaker VTL (pass-2 equivalent)
@@ -921,12 +1073,16 @@ def label_incremental(
 
     frozen_args = []
     for s in new_samples:
-        speaker   = s.get("speaker", s.get("group", "unknown"))
-        group     = s.get("group", speaker)
+        speaker   = s.get("speaker", "unknown")
+        meta      = s.get("speaker_meta")
+        group     = (meta.vtl_class if isinstance(meta, SpeakerMeta)
+                     else s.get("group", "unknown"))
         final_vtl = smoother.smoothed_speaker_vtl(group, speaker)
-        frozen    = VTLSmoother(prior_strength=cfg.vtl_prior_strength, sample_alpha=cfg.vtl_sample_alpha)
+        frozen    = VTLSmoother(prior_strength=1e9, sample_alpha=cfg.vtl_sample_alpha)
         frozen._speaker_vtls[speaker] = [final_vtl]
         frozen._group_vtls[group]     = [final_vtl]
+        if meta and isinstance(meta, SpeakerMeta) and meta.vtl_prior_mm is not None:
+            frozen.register_speaker_override(speaker, meta.vtl_prior_mm)
         frozen_args.append((dict(s), cfg, frozen))
 
     new_labelled = _parallel_map(frozen_args, n_workers, verbose, "incremental")
@@ -1160,16 +1316,10 @@ class OutlierConfig:
     def __post_init__(self):
         if self.f1_bounds_hz is None:
             self.f1_bounds_hz = {
-                ("male",    "adult"):   (200.0,  950.0),
-                ("female",  "adult"):   (200.0, 1100.0),
-                ("male",    "child"):   (200.0, 1250.0),
-                ("female",  "child"):   (200.0, 1250.0),
-                # collapsed dimensions — use the more permissive ceiling
-                ("male",    "unknown"): (200.0, 1250.0),
-                ("female",  "unknown"): (200.0, 1250.0),
-                ("unknown", "adult"):   (200.0, 1100.0),
-                ("unknown", "child"):   (200.0, 1250.0),
-                ("unknown", "unknown"): (200.0, 1250.0),
+                "large":   (200.0,  950.0),
+                "medium":  (200.0, 1100.0),
+                "small":   (200.0, 1250.0),
+                "unknown": (200.0, 1250.0),
             }
 
     # VTL: flag windows outside speaker_mean +/- vtl_std_threshold * speaker_std
@@ -1234,17 +1384,10 @@ def flag_outliers(
         flags: dict[str, np.ndarray] = {}
 
         # --- F1 bounds ---
-        f1 = s["formant_hz"][:, 0]
-        sex, age = group if isinstance(group, tuple) else ("unknown", "unknown")
-        f1_floor, f1_ceil = next(
-            (cfg.f1_bounds_hz[k] for k in (
-                (sex, age),
-                (sex, "unknown"),
-                ("unknown", age),
-                ("unknown", "unknown"),
-            ) if k in cfg.f1_bounds_hz),
-            (200.0, 1250.0),
-        )
+        f1       = s["formant_hz"][:, 0]
+        vtl_cls  = (group if isinstance(group, str) and group in cfg.f1_bounds_hz
+                    else "unknown")
+        f1_floor, f1_ceil = cfg.f1_bounds_hz.get(vtl_cls, (200.0, 1250.0))
         flags["f1_bounds"] = (
             np.isfinite(f1) & ((f1 < f1_floor) | (f1 > f1_ceil))
         )
@@ -1341,8 +1484,8 @@ def build_metadata(
             "n_samples":         len(grp_spks[grp]),
             "n_windows":         len(arr),
             "vtl_literature_mm": VTL_PRIOR_MM.get(
-                grp if isinstance(grp, tuple) else ("unknown", "unknown"),
-                VTL_PRIOR_MM[("unknown", "unknown")],
+                grp if isinstance(grp, str) else "unknown",
+                VTL_PRIOR_MM["unknown"],
             ),
         }
 

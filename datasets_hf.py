@@ -7,7 +7,7 @@ Each loader returns a list of dicts compatible with the embedding pipeline:
     {
         "audio"         : np.ndarray,   # (T,) float32
         "label"         : str,          # IPA vowel label
-        "group"         : str,          # demographic group (men/women/boys/girls/...)
+        "speaker_meta"  : SpeakerMeta,  # vtl_class, gender, age, tags
         "speaker"       : str,          # unique speaker ID within dataset
         "dialect"       : str,          # BCP-47-style dialect tag
         "modality"      : str,          # "spoken", "sung", etc.
@@ -24,12 +24,11 @@ label
     categories. Cross-dataset normalisation (e.g. collapsing rhotic /er/
     with non-rhotic /ew/) should happen at analysis time, not load time.
 
-group
-    (sex, age) tuple identifying the demographic group for VTL prior lookup
-    and outlier flagging.  sex is one of "male"/"female"/"unknown"; age is
-    one of "adult"/"child"/"unknown".  Hillenbrand speakers map to fully
-    specified tuples; datasets with unknown demographics use "unknown" for
-    the relevant dimension(s).
+speaker_meta
+    SpeakerMeta instance encoding vtl_class ("small"/"medium"/"large"/"unknown"),
+    gender (free-form string), age ("adult"/"teen"/"child"/"unknown"), and an
+    open-ended tags frozenset.  vtl_class drives the VTL smoothing prior;
+    the other fields are demographic metadata only.
 
 speaker
     Unique ID within the dataset. For Hillenbrand this is parsed from the
@@ -67,6 +66,7 @@ import re
 import numpy as np
 from datasets import load_dataset
 from tqdm import tqdm
+from labeller import Modality, SpeakerMeta
 
 
 # ---------------------------------------------------------------------------
@@ -88,13 +88,15 @@ HILLENBRAND_TO_IPA: dict[str, str] = {
     "uw": "u",   # who'd
 }
 
-# Hillenbrand group codes in filenames -> (sex, age) tuple
-_HILLENBRAND_GROUP_CODE: dict[str, tuple] = {
-    "m": ("male",   "adult"),
-    "w": ("female", "adult"),
-    "b": ("male",   "child"),
-    "g": ("female", "child"),
+# Hillenbrand group codes -> SpeakerMeta
+# vtl_class derived from literature means: men=large, women=medium, children=small
+_HILLENBRAND_SPEAKER_META: dict[str, SpeakerMeta] = {
+    "m": SpeakerMeta(vtl_class="large",  gender="man",   age="adult"),
+    "w": SpeakerMeta(vtl_class="medium", gender="woman", age="adult"),
+    "b": SpeakerMeta(vtl_class="small",  gender="boy",   age="child"),
+    "g": SpeakerMeta(vtl_class="small",  gender="girl",  age="child"),
 }
+_HILLENBRAND_DEFAULT_META = SpeakerMeta()
 
 
 # ---------------------------------------------------------------------------
@@ -134,12 +136,12 @@ def _parse_hillenbrand_speaker(item: dict, first_item: bool = False) -> str:
     return "unknown"
 
 
-def _hillenbrand_group_from_speaker(speaker: str) -> tuple:
-    """Map speaker ID like 'm01' to (sex, age) group tuple."""
+def _hillenbrand_meta_from_speaker(speaker: str) -> SpeakerMeta:
+    """Map speaker ID like 'm01' to a SpeakerMeta instance."""
     if speaker == "unknown":
-        return ("unknown", "unknown")
+        return _HILLENBRAND_DEFAULT_META
     code = speaker[0].lower()
-    return _HILLENBRAND_GROUP_CODE.get(code, ("unknown", "unknown"))
+    return _HILLENBRAND_SPEAKER_META.get(code, _HILLENBRAND_DEFAULT_META)
 
 
 # ---------------------------------------------------------------------------
@@ -192,15 +194,15 @@ def load_hillenbrand(split: str = "train", sr: int = 16000) -> list[dict]:
         ipa_label = HILLENBRAND_TO_IPA.get(raw_label, raw_label)
 
         speaker = _parse_hillenbrand_speaker(item, first_item=(idx == 0))
-        group = _hillenbrand_group_from_speaker(speaker)
+        meta    = _hillenbrand_meta_from_speaker(speaker)
 
         dataset.append({
             "audio":        audio,
             "label":        ipa_label,
-            "group":        group,
             "speaker":      speaker,
+            "speaker_meta": meta,
+            "modality":     Modality.from_path("Spoken"),
             "dialect":      "en-US-GenAm",
-            "modality":     "spoken",
             "source":       "hillenbrand1995",
             "formants":     formants_raw.mean(axis=0),
             "formants_std": formants_raw.std(axis=0),
