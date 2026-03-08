@@ -836,8 +836,11 @@ def label_incremental(
     dataset for smoothing, without re-running the full pipeline on everything.
 
     When ``refine=False`` (default):
-        A single pass-2-equivalent extraction is run on ``new_samples`` only,
-        using a smoother pre-populated from ``existing``.  Only the newly
+        A seed pass is first run on ``new_samples`` to estimate each new
+        speaker's VTL from their own audio, making the formant ceiling
+        independent of the group prior.  A single pass-2-equivalent
+        extraction then runs using a smoother combining the existing dataset
+        statistics with the freshly seeded speaker VTLs.  Only the newly
         labelled samples are returned.
 
     When ``refine=True``:
@@ -865,7 +868,7 @@ def label_incremental(
     """
     if cfg is None:
         cfg = LabellerConfig()
-
+    print(cfg)
     for s in new_samples:
         s.setdefault("sr", sr)
 
@@ -886,6 +889,31 @@ def label_incremental(
             groups.items(), key=lambda x: str(x[0])
         ))
         print(f"[label_incremental] Smoother seeded from existing: {breakdown}")
+
+    # Seed per-speaker VTL for new speakers from their own audio before the
+    # main pass.  Without this the formant ceiling is derived purely from the
+    # group prior, making the ceiling — and therefore the pole assignment —
+    # sensitive to the group label even when vtl_sample_alpha is high.
+    if verbose:
+        print("[label_incremental] Seeding VTL for new speakers...")
+
+    seed_args    = [(s, cfg) for s in new_samples]
+    if n_workers == 1:
+        seed_results = [_worker_seed_vtl(a) for a in seed_args]
+    else:
+        with ProcessPoolExecutor(max_workers=n_workers) as pool:
+            seed_results = list(pool.map(_worker_seed_vtl, seed_args))
+
+    for group, speaker, vtl in seed_results:
+        smoother.update(group, speaker, vtl)
+
+    if verbose:
+        new_speakers = {s.get("speaker", "unknown") for s in new_samples}
+        for spk in sorted(new_speakers):
+            grp = next((s["group"] for s in new_samples
+                        if s.get("speaker") == spk), ("unknown","unknown"))
+            vtl = smoother.smoothed_speaker_vtl(grp, spk)
+            print(f"  seeded {spk} ({grp}): VTL={vtl:.1f}mm")
 
     # Single pass with frozen per-speaker VTL (pass-2 equivalent)
     if verbose:
