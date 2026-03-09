@@ -452,10 +452,18 @@ def _extract_raw_formants(
     for i in range(cfg.n_praat_formants):
         fv = formant.get_value_at_time(i + 1, t_mid)
         bv = formant.get_bandwidth_at_time(i + 1, t_mid)
-        if fv is not None and np.isfinite(fv) and fv > 0:
-            freqs[i] = fv
-        if bv is not None and np.isfinite(bv) and bv > 0:
-            bws[i] = bv
+        try:
+            fv = float(fv)
+            if np.isfinite(fv) and fv > 0:
+                freqs[i] = fv
+        except (TypeError, ValueError):
+            pass
+        try:
+            bv = float(bv)
+            if np.isfinite(bv) and bv > 0:
+                bws[i] = bv
+        except (TypeError, ValueError):
+            pass
 
     return freqs, bws, spectral_slope
 
@@ -479,13 +487,24 @@ def _assign_formant_indices(
     raw_bws: np.ndarray,
     vtl_mm: float,
     n_out: int = N_FORMANTS,
+    nyquist_hz: float = np.inf,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Greedily assign raw Praat poles to anatomically correct slots using
     expected positions from the uniform-tube model.  Unmatched slots -> NaN.
+
+    n_out is clamped to the number of formants that can physically exist below
+    nyquist_hz (i.e. floor(nyquist / delta_F)).  Slots above this limit are
+    always NaN — no spurious extrapolated values are assigned.
     """
-    out_f = np.full(n_out, np.nan, dtype=np.float32)
-    out_b = np.full(n_out, np.nan, dtype=np.float32)
+    # Clip n_out to the highest formant number below Nyquist
+    if np.isfinite(nyquist_hz) and nyquist_hz > 0 and             np.isfinite(vtl_mm) and vtl_mm > 0:
+        delta_f    = SPEED_OF_SOUND_MM_S / (2.0 * vtl_mm)
+        n_possible = int(np.floor(nyquist_hz / delta_f))
+        n_out      = max(1, min(n_out, n_possible))
+
+    out_f = np.full(N_FORMANTS, np.nan, dtype=np.float32)
+    out_b = np.full(N_FORMANTS, np.nan, dtype=np.float32)
 
     if not np.isfinite(vtl_mm) or vtl_mm <= 0:
         valid   = raw_freqs[np.isfinite(raw_freqs)][:n_out]
@@ -670,7 +689,7 @@ def _extract_sample(
         raw_freqs, raw_bws, slope = _extract_raw_formants(frame, sr, cfg, win_s, dynamic_ceiling)
         vtl_raw      = _vtl_from_formants(raw_freqs)
         smoothed_vtl = vtl_smoother.smooth_vtl(group, speaker, vtl_raw)
-        freqs_out, bws_out = _assign_formant_indices(raw_freqs, raw_bws, smoothed_vtl)
+        freqs_out, bws_out = _assign_formant_indices(raw_freqs, raw_bws, smoothed_vtl, nyquist_hz=sr / 2.0)
         vtl_sample   = _vtl_from_formants(freqs_out)
 
         t_centres.append(t_centre_s)
@@ -691,12 +710,14 @@ def _extract_sample(
 
     return {
         "speaker":          speaker,
+        "speaker_meta":     sample.get("speaker_meta"),
         "group":            group,
         "label":            sample.get("label", ""),
         "source":           sample.get("source", ""),
         "modality":         modality,
         "dialect":          sample.get("dialect", "unknown"),
         "audio":            audio,
+        "sr":               sr,
         "window_length_ms": win_ms,
         "hop_ms":           cfg.hop_ms,
         "t_centre_s":       _f32(t_centres),
