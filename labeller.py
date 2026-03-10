@@ -270,7 +270,7 @@ class LabellerConfig:
     min_f0_hz:              float = 50.0
     max_f0_hz:              float = 600.0
     max_formant_hz:         float = 5500.0
-    n_praat_formants:       int   = N_FORMANTS + 2
+    n_praat_formants:       int   = N_FORMANTS  # upper bound; Nyquist-clipped per window
     vtl_prior_strength:     float = 10.0    # n0 for uncertainty-weighted blend
     vtl_sample_alpha:       float = 0.30    # fixed sample-level blend fraction [0, 0.9]
     voicing_threshold_dbfs: float = -40.0
@@ -401,6 +401,7 @@ def _extract_raw_formants(
     cfg: LabellerConfig,
     win_s: float,
     max_formant_hz: Optional[float] = None,
+    n_formants: Optional[int] = None,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """
     Extract raw Praat poles from a frame.  Applies adaptive pre-emphasis when
@@ -410,9 +411,14 @@ def _extract_raw_formants(
     _extract_sample to pass in a speaker-adapted ceiling derived from the
     smoothed VTL estimate.
 
-    Returns (freqs, bws, spectral_slope) — arrays are (n_praat_formants,).
+    n_formants overrides cfg.n_praat_formants — used by _extract_sample to
+    pass the Nyquist-clipped formant count so Praat only hunts for poles that
+    can physically exist in the signal.  Defaults to cfg.n_praat_formants.
+
+    Returns (freqs, bws, spectral_slope) — arrays are (n_formants,).
     """
     ceiling        = max_formant_hz if max_formant_hz is not None else cfg.max_formant_hz
+    n_formants     = n_formants if n_formants is not None else cfg.n_praat_formants
     spectral_slope = np.nan
     analysis       = frame.astype(np.float32)
 
@@ -429,7 +435,7 @@ def _extract_raw_formants(
 
     try:
         fp      = call(snd, "To FormantPath (burg)...",
-                       win_s / 2.0, cfg.n_praat_formants,
+                       win_s / 2.0, n_formants,
                        ceiling, win_s,
                        praat_preemph, 0.05, 4)
         formant = call(fp, "Extract Formant")
@@ -437,19 +443,19 @@ def _extract_raw_formants(
         try:
             formant = snd.to_formant_burg(
                 time_step=win_s / 2.0,
-                max_number_of_formants=cfg.n_praat_formants,
+                max_number_of_formants=n_formants,
                 maximum_formant=ceiling,
                 window_length=win_s,
                 pre_emphasis_from=praat_preemph,
             )
         except Exception:
-            empty = np.full(cfg.n_praat_formants, np.nan, dtype=np.float32)
+            empty = np.full(n_formants, np.nan, dtype=np.float32)
             return empty.copy(), empty.copy(), spectral_slope
 
     t_mid = snd.duration / 2.0
-    freqs = np.full(cfg.n_praat_formants, np.nan, dtype=np.float32)
-    bws   = np.full(cfg.n_praat_formants, np.nan, dtype=np.float32)
-    for i in range(cfg.n_praat_formants):
+    freqs = np.full(n_formants, np.nan, dtype=np.float32)
+    bws   = np.full(n_formants, np.nan, dtype=np.float32)
+    for i in range(n_formants):
         fv = formant.get_value_at_time(i + 1, t_mid)
         bv = formant.get_bandwidth_at_time(i + 1, t_mid)
         try:
@@ -686,7 +692,18 @@ def _extract_sample(
 
         period = _periodicity(frame, sr, f0)
 
-        raw_freqs, raw_bws, slope = _extract_raw_formants(frame, sr, cfg, win_s, dynamic_ceiling)
+        # Nyquist-clipped formant count: only ask Praat for poles that can
+        # physically exist.  Uses smoothed speaker VTL so it's stable across
+        # windows; falls back to cfg.n_praat_formants during the seed pass.
+        nyquist_hz = sr / 2.0
+        if np.isfinite(speaker_vtl) and speaker_vtl > 0:
+            delta_f  = SPEED_OF_SOUND_MM_S / (2.0 * speaker_vtl)
+            n_praat  = max(1, min(cfg.n_praat_formants,
+                                  int(np.floor(nyquist_hz / delta_f))))
+        else:
+            n_praat  = cfg.n_praat_formants
+        raw_freqs, raw_bws, slope = _extract_raw_formants(
+            frame, sr, cfg, win_s, dynamic_ceiling, n_formants=n_praat)
         vtl_raw      = _vtl_from_formants(raw_freqs)
         smoothed_vtl = vtl_smoother.smooth_vtl(group, speaker, vtl_raw)
         freqs_out, bws_out = _assign_formant_indices(raw_freqs, raw_bws, smoothed_vtl, nyquist_hz=sr / 2.0)
