@@ -289,13 +289,21 @@ def _poles_to_formants(
 
 
 # ---------------------------------------------------------------------------
-# Spectral slope (mirrors labeller._estimate_spectral_tilt_alpha)
+# Spectral slope and adaptive pre-emphasis
+# (mirrors labeller._estimate_spectral_tilt_alpha exactly)
 # ---------------------------------------------------------------------------
 
-def _spectral_slope(frame: np.ndarray, sr: int) -> float:
+def _estimate_slope_and_alpha(frame: np.ndarray, sr: int) -> tuple[float, float]:
     """
-    Estimate spectral tilt (dB/octave) by log-log regression over 300–4000 Hz.
-    Returns NaN on failure.
+    Estimate spectral tilt (dB/octave) and the matched first-order
+    pre-emphasis alpha by fitting log-magnitude vs log2-frequency in
+    300–4000 Hz.
+
+    Mirrors labeller._estimate_spectral_tilt_alpha exactly so that
+    standalone use of tvlp produces the same pre-emphasis as the labeller
+    pipeline does when it calls _extract_raw_formants.
+
+    Returns (slope_db_oct, alpha); both NaN on failure.
     """
     try:
         w     = np.hanning(len(frame))
@@ -303,13 +311,49 @@ def _spectral_slope(frame: np.ndarray, sr: int) -> float:
         freqs = np.fft.rfftfreq(len(frame), 1.0 / sr)
         mask  = (freqs >= _SLOPE_F_LOW) & (freqs <= _SLOPE_F_HIGH)
         if mask.sum() < 4:
-            return np.nan
-        x_log        = np.log2(freqs[mask])
-        A            = np.vstack([x_log, np.ones_like(x_log)]).T
-        slope, _     = np.linalg.lstsq(A, 20.0 * np.log10(mag[mask]), rcond=None)[0]
-        return float(slope)
+            return np.nan, np.nan
+
+        x_log = np.log2(freqs[mask])
+        A     = np.vstack([x_log, np.ones_like(x_log)]).T
+        slope, _ = np.linalg.lstsq(
+            A, 20.0 * np.log10(mag[mask]), rcond=None)[0]
+
+        target       = -slope
+        w12          = 2.0 * np.pi * np.array([500.0, 4000.0]) / sr
+        desired_diff = target * np.log2(4000.0 / 500.0)
+        best_alpha, best_err = 0.95, 1e9
+        for alpha in np.linspace(0.70, 0.99, 300):
+            H    = np.abs(1.0 - alpha * np.exp(-1j * w12))
+            diff = 20.0 * np.log10(H[1] / H[0])
+            if (err := abs(diff - desired_diff)) < best_err:
+                best_err, best_alpha = err, alpha
+
+        return float(slope), float(best_alpha)
     except Exception:
+        return np.nan, np.nan
+
+
+def _alpha_from_slope(slope: float, sr: int) -> float:
+    """
+    Derive the matched pre-emphasis alpha from a known spectral slope
+    (dB/octave).  This is the second half of _estimate_slope_and_alpha,
+    separated so the labeller can pass its already-computed slope without
+    repeating the FFT.
+
+    Returns NaN if slope is not finite.
+    """
+    if not np.isfinite(slope):
         return np.nan
+    target       = -slope
+    w12          = 2.0 * np.pi * np.array([500.0, 4000.0]) / sr
+    desired_diff = target * np.log2(4000.0 / 500.0)
+    best_alpha, best_err = 0.95, 1e9
+    for alpha in np.linspace(0.70, 0.99, 300):
+        H    = np.abs(1.0 - alpha * np.exp(-1j * w12))
+        diff = 20.0 * np.log10(H[1] / H[0])
+        if (err := abs(diff - desired_diff)) < best_err:
+            best_err, best_alpha = err, alpha
+    return float(best_alpha)
 
 
 # ---------------------------------------------------------------------------
@@ -325,7 +369,8 @@ def extract_formants(
     lambda_smooth: float = _DEFAULT_LAMBDA,
     order: Optional[int] = None,
     n_sub: int = _DEFAULT_N_SUB,
-    preemphasis_alpha: float = 0.97,
+    spectral_slope: Optional[float] = None,
+    preemphasis_alpha: Optional[float] = None,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """
     Estimate formant frequencies and bandwidths from an audio frame using
@@ -341,21 +386,40 @@ def extract_formants(
                         _extract_raw_formants)
     max_formant_hz    : reject poles above this frequency (Hz)
     lambda_smooth     : temporal smoothness regularisation weight.
-                        Default 2.0 gives robust formant recovery at low F0;
-                        set 0.0 for independent per-subframe LP (not recommended)
+                        Default 2.0 gives robust formant recovery at low F0.
+                        Set 0.0 for independent per-subframe LP (not recommended).
     order             : LP order (defaults to max(2*n_formants, 14))
     n_sub             : number of sub-frames for the time-varying fit
-    preemphasis_alpha : first-order pre-emphasis coefficient applied before LP.
-                        Flattens the glottal source slope so LP poles track
-                        vocal tract resonances rather than harmonic structure.
-                        Set 0.0 to disable.  Default 0.97 matches a ~3 dB/oct
-                        boost that counteracts typical glottal roll-off.
+    spectral_slope    : spectral tilt in dB/octave, as computed by
+                        labeller._estimate_spectral_tilt_alpha().
+                        When provided, the matched pre-emphasis alpha is
+                        derived from this value directly — skipping the
+                        internal FFT — so the labeller's already-computed
+                        slope is reused rather than recomputed.
+                        Pass np.nan to suppress pre-emphasis entirely.
+    preemphasis_alpha : first-order pre-emphasis coefficient.
+                        Takes precedence over spectral_slope if both are given.
+                        Pass 0.0 to suppress pre-emphasis.
+                        When neither this nor spectral_slope is provided,
+                        slope and alpha are estimated internally from the frame
+                        (same method as labeller adaptive pre-emphasis).
+
+    Pre-emphasis resolution order
+    -----------------------------
+    1. preemphasis_alpha is not None  →  use it directly
+    2. spectral_slope is not None     →  derive alpha via _alpha_from_slope()
+    3. neither provided               →  estimate slope+alpha from frame
+
+    The returned slope is always the spectral tilt of the *raw* frame:
+    - path 1 : NaN (alpha was given externally with no slope context)
+    - path 2 : the spectral_slope argument (already computed by labeller)
+    - path 3 : freshly estimated from the frame
 
     Returns
     -------
     freqs : (n_formants,) float32  — formant frequencies; NaN for missed slots
     bws   : (n_formants,) float32  — formant bandwidths;  NaN for missed slots
-    slope : float                  — spectral slope (dB/oct); NaN on failure
+    slope : float                  — spectral slope (dB/oct); NaN if unavailable
     """
     out_f = np.full(n_formants, np.nan, dtype=np.float32)
     out_b = np.full(n_formants, np.nan, dtype=np.float32)
@@ -369,25 +433,32 @@ def extract_formants(
     if not np.isfinite(energy) or energy < 1e-20:
         return out_f, out_b, np.nan
     if np.all(frame == frame[0]):
-        # DC or constant — no AC energy, LP is ill-defined
         return out_f, out_b, np.nan
 
-    # Spectral slope estimated before pre-emphasis (on the raw frame)
-    slope = _spectral_slope(frame, sr)
+    # --- Resolve pre-emphasis alpha and output slope ---
+    if preemphasis_alpha is not None:
+        # Path 1: caller supplied alpha directly
+        alpha        = float(preemphasis_alpha)
+        slope_out    = np.nan
+    elif spectral_slope is not None:
+        # Path 2: labeller already computed the slope — derive alpha from it,
+        # avoids redundant FFT and keeps pre-emphasis consistent with Praat path
+        alpha        = _alpha_from_slope(float(spectral_slope), sr)
+        slope_out    = float(spectral_slope)
+    else:
+        # Path 3: standalone use — estimate both from the frame
+        slope_out, alpha = _estimate_slope_and_alpha(frame, sr)
 
-    # Apply first-order pre-emphasis to flatten glottal source roll-off.
-    # This is the same operation as labeller._apply_preemphasis and is
-    # essential for LP to track resonances rather than harmonic peaks.
-    if preemphasis_alpha > 0.0:
-        analysis = np.empty_like(frame)
-        analysis[0]  = frame[0]
-        analysis[1:] = frame[1:] - preemphasis_alpha * frame[:-1]
+    # Apply first-order pre-emphasis (skip if alpha is NaN or zero)
+    if np.isfinite(alpha) and alpha > 0.0:
+        analysis      = np.empty_like(frame)
+        analysis[0]   = frame[0]
+        analysis[1:]  = frame[1:] - alpha * frame[:-1]
     else:
         analysis = frame
 
     lp_order = order if order is not None else max(2 * n_formants, _DEFAULT_ORDER)
 
-    # Fit time-varying LP and take centre sub-frame coefficients
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         coeffs_all = fit_tvlp(analysis, sr,
@@ -400,4 +471,4 @@ def extract_formants(
 
     freqs, bws = _poles_to_formants(coeffs, sr, max_formant_hz, n_formants)
 
-    return freqs, bws, slope
+    return freqs, bws, slope_out
