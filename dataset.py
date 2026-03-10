@@ -243,7 +243,7 @@ _DEFAULT_MAX_FORMANT = 5500.0  # conservative default; works for most adult spee
 
 def load_personal_dataset(
     root: str,
-    sr: int = 16000,
+    sr: int | None = None,
     extensions: tuple[str, ...] = (".flac", ".wav", ".mp3"),
     speaker_meta: "dict[str, SpeakerMeta] | None" = None,
     dialect: str = "unknown",
@@ -267,7 +267,8 @@ def load_personal_dataset(
     Parameters
     ----------
     root         : path to the root recordings directory
-    sr           : target sample rate for audio loading
+    sr           : target sample rate for audio loading. Defaults to None
+                   (native rate). Pass an integer to force resampling.
     extensions   : audio file extensions to include
     speaker_meta : dict mapping speaker name to SpeakerMeta, e.g.
                    {"Hannah": SpeakerMeta(vtl_class="large", gender="woman",
@@ -325,7 +326,7 @@ def load_personal_dataset(
 
                 for audio_path in audio_files:
                     try:
-                        audio, _ = librosa.load(
+                        audio, actual_sr = librosa.load(
                             str(audio_path), sr=sr, mono=True, dtype=np.float32
                         )
                         peak = np.abs(audio).max()
@@ -336,6 +337,7 @@ def load_personal_dataset(
 
                         dataset.append({
                             "audio":        audio,
+                            "sr":            actual_sr,
                             "label":        vowel,
                             "speaker":      speaker,
                             "speaker_meta": meta,
