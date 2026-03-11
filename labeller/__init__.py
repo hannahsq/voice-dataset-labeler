@@ -93,7 +93,7 @@ from .config import (
 )
 
 # --- types ---
-from .types import Modality, SpeakerMeta, FormantExtractor
+from .types import Modality, SpeakerMeta
 
 # --- acoustic ---
 from .acoustic import (
@@ -112,8 +112,10 @@ from .formants import (
     _vtl_from_formants,
     _assign_formant_indices,
     VTLSmoother,
-    PraatFormantExtractor,
 )
+
+# --- extractors ---
+from .extractors import FormantExtractor, PraatFormantExtractor, TVLPFormantExtractor
 
 # --- pipeline ---
 from .pipeline import (

@@ -13,7 +13,7 @@ import numpy as np
 import parselmouth
 
 from .config import LabellerConfig, N_FORMANTS, SPEED_OF_SOUND_MM_S
-from .types import SpeakerMeta, Modality, FormantExtractor
+from .types import SpeakerMeta, Modality
 from .acoustic import (
     _loudness_dbfs,
     _periodicity,
@@ -26,8 +26,8 @@ from .formants import (
     _vtl_from_formants,
     _assign_formant_indices,
     VTLSmoother,
-    PraatFormantExtractor,
 )
+from .extractors import FormantExtractor, PraatFormantExtractor
 
 
 # ---------------------------------------------------------------------------
