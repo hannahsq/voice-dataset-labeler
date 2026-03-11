@@ -587,150 +587,55 @@ def test_regularisation_improves_accuracy():
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# T19  TVLP vs Praat Burg: F2 accuracy on jittered synthetic vowel  [EMPIRICAL]
+# T19  [RETIRED] — TVLP vs Praat Burg comparative accuracy
 #
-# Motivation
+# We attempted to construct a synthetic test condition where TVLP reliably
+# outperforms Praat's Burg estimator.  Two hypotheses were tested and both
+# were falsified by empirical measurement against real parselmouth output:
+#
+# Hypothesis 1 — jitter disrupts harmonic anchoring
+# --------------------------------------------------
+# At F0=150 Hz, the 11th harmonic falls ~30 Hz from F2, and we hypothesised
+# that period-to-period jitter would smear this harmonic, hurting Burg while
+# TVLP's longer window averaged through the variation.  In practice:
+#   - jitter_frac=0.05: TVLP 28.7 Hz, Burg 3.8 Hz  (Burg wins decisively)
+# Burg is robust to mild jitter because Praat's internal formant tracker
+# already averages estimates across frames.
+#
+# Hypothesis 2 — synthetic vibrato (periodic F0 modulation) disrupts Burg
+# -------------------------------------------------------------------------
+# A 100-cent vibrato sweep causes harmonics to sweep through the formant
+# frequency, which we hypothesised would confuse a short-window estimator.
+# In practice, vibrato *improves* Praat Burg (F0=150, rate=20Hz: 5.4 Hz error)
+# because each harmonic sweeps through the formant repeatedly, and Praat's
+# time-averaging of formant *estimates* across frames integrates those sweeps
+# into a stable resonance estimate.  TVLP, averaging LP *coefficients* before
+# pole extraction, sees a smeared autocorrelation and gets worse:
+#   rate=0 Hz:  Burg 21.7 Hz, TVLP 22.7 Hz  (tie)
+#   rate=10 Hz: Burg  8.6 Hz, TVLP 103.0 Hz (Burg wins decisively)
+#   rate=20 Hz: Burg  5.4 Hz, TVLP  79.7 Hz (Burg wins decisively)
+#
+# Root cause
 # ----------
-# At F0=150 Hz with low jitter, Praat's Burg estimator happens to perform
-# well because the 11th harmonic (1650 Hz) falls only ~30 Hz from F2 (~1620 Hz)
-# — Burg effectively reads off the harmonic peak.  Adding jitter (period-to-
-# period timing variation) smears the harmonic comb so no single harmonic
-# reliably anchors near F2.  Burg, operating on a short (~25 ms) window, sees
-# a different instantaneous harmonic pattern each frame and struggles to
-# recover the resonance envelope.
+# TVLP smooths LP coefficients across time; Praat smooths formant track
+# estimates across time.  Smoothing after pole extraction is architecturally
+# more robust to F0 modulation than smoothing before it.  The correct fix is
+# a redesign: run short-window LP frames, extract poles per frame, then apply
+# a Kalman-style smoother to the pole *trajectories* with the VTL prior as
+# the process model.  This is also a more natural integration point for the
+# TCN, which can provide per-frame formant estimates with uncertainty to feed
+# the smoother.
 #
-# TVLP's temporal regularisation averages LP coefficients across a longer
-# analysis window (~150 ms, ~22 pitch periods at F0=150), smoothing through
-# the per-period variation to recover the stable underlying resonance.
-# This is the structural advantage TVLP offers over short-window Burg for
-# singing voice with natural pitch variation.
-#
-# Test design
-# -----------
-# Neutral vowel (fn_norm=[1,3,5]), VTL=162 mm, F0=150 Hz, jitter_frac=0.05
-# (mild but sufficient to disrupt harmonic anchoring), 500 ms clips.
-# N=10 independent seeds (different jitter realisations).
-# We measure the error on F2 specifically — see T11/T12 comments for why.
-#
-# Assertion: TVLP median F2 error < Burg median F2 error / 3.
-# Empirically observed ratio with Python LP proxy: ~8–13×.
-# The ÷3 threshold is deliberately conservative to remain stable against
-# differences between real Praat Burg and the Python LP approximation used
-# during development.
-#
-# What this test does NOT claim
-# ------------------------------
-# - TVLP is not better at F0=250 Hz where F2 sits maximally between harmonics
-#   AND harmonic spacing (~250 Hz) is close to delta_F/2 (~270 Hz), creating
-#   a near-symmetric spectral valley that defeats both methods equally.
-# - No claim is made about F3+ accuracy.
-# - Performance on real (non-synthetic) recordings is not tested here.
-#
-# Requires: parselmouth  (skipped gracefully if not installed)
+# Current status
+# --------------
+# TVLP in its present form is a useful complement to Burg for non-modulated
+# or mildly noisy signals (T11-T14 show it works well at low F0 on clean
+# synthetic vowels).  A comparative advantage over Praat on voiced singing
+# has not been demonstrated on synthetic signals and should be evaluated
+# on real recordings where source irregularity is less clean than the
+# synth model.  The pole-trajectory smoother redesign is tracked as a
+# future direction.
 # ---------------------------------------------------------------------------
-
-try:
-    import parselmouth
-    _PARSELMOUTH_OK = True
-except ImportError:
-    _PARSELMOUTH_OK = False
-
-
-def _burg_formants(
-    audio: np.ndarray,
-    sr: int,
-    win_s: float = 0.025,
-    n_formants: int = 5,
-    max_formant_hz: float = 5500.0,
-    preemph_hz: float = 50.0,
-) -> np.ndarray:
-    """
-    Extract formant frequencies using Praat's Burg estimator via parselmouth.
-
-    Mirrors the fallback path in labeller._extract_raw_formants:
-    a single short window centred on the frame, no adaptive pre-emphasis.
-    Returns (n_formants,) float32, NaN for undetected slots.
-    """
-    out = np.full(n_formants, np.nan, dtype=np.float32)
-    try:
-        snd     = parselmouth.Sound(audio.astype(np.float64),
-                                    sampling_frequency=float(sr))
-        formant = snd.to_formant_burg(
-            time_step              = win_s / 2.0,
-            max_number_of_formants = n_formants,
-            maximum_formant        = max_formant_hz,
-            window_length          = win_s,
-            pre_emphasis_from      = preemph_hz,
-        )
-        t_mid = snd.duration / 2.0
-        for i in range(n_formants):
-            try:
-                fv = float(formant.get_value_at_time(i + 1, t_mid))
-                if np.isfinite(fv) and fv > 0:
-                    out[i] = fv
-            except (TypeError, ValueError):
-                pass
-    except Exception:
-        pass
-    return out
-
-
-def test_tvlp_vs_burg_jitter():
-    label = "T19_tvlp_beats_burg_f2_jitter"
-
-    if not _IMPORT_OK:
-        _skip(label, "tvlp import failed"); return
-    if not _SYNTH_OK:
-        _skip(label, "synth import failed"); return
-    if not _PARSELMOUTH_OK:
-        _skip(label, "parselmouth not installed (pip install praat-parselmouth)"); return
-
-    F0          = 150.0
-    VTL         = 162.0
-    FN_NORM     = [1.0, 3.0, 5.0]
-    JITTER_FRAC = 0.05   # mild jitter — enough to smear harmonic anchoring
-    DURATION_S  = 0.5    # long enough for TVLP to average across ~22 periods
-    N_SEEDS     = 10
-
-    burg_f2_errs = []
-    tvlp_f2_errs = []
-
-    for seed in range(N_SEEDS):
-        cfg = SynthConfig(
-            sr=SR, n_formants=len(FN_NORM), duration_s=DURATION_S,
-            f0_hz=F0, vtl_mm=VTL,
-            fn_norm=np.array(FN_NORM, dtype=np.float32),
-            jitter_frac=JITTER_FRAC,
-        )
-        audio, meta = _generate_vowel(cfg, rng=np.random.default_rng(seed))
-        truth_f2    = float(meta.formant_hz[1])
-
-        # --- Burg: 25 ms window, standard Praat pre-emphasis ---
-        burg_freqs = _burg_formants(audio, SR, win_s=0.025, n_formants=5)
-        burg_fin   = burg_freqs[np.isfinite(burg_freqs)]
-        burg_f2    = (float(burg_fin[np.argmin(np.abs(burg_fin - truth_f2))])
-                      if len(burg_fin) else np.nan)
-
-        # --- TVLP: full clip, adaptive pre-emphasis (path 3) ---
-        tvlp_freqs, _, _ = tvlp.extract_formants(
-            audio, sr=SR, n_formants=len(FN_NORM))
-        tvlp_fin   = tvlp_freqs[np.isfinite(tvlp_freqs)]
-        tvlp_f2    = (float(tvlp_fin[np.argmin(np.abs(tvlp_fin - truth_f2))])
-                      if len(tvlp_fin) else np.nan)
-
-        burg_f2_errs.append(abs(burg_f2 - truth_f2))
-        tvlp_f2_errs.append(abs(tvlp_f2 - truth_f2))
-
-    burg_med = float(np.nanmedian(burg_f2_errs))
-    tvlp_med = float(np.nanmedian(tvlp_f2_errs))
-
-    _lt(label,
-        tvlp_med,
-        burg_med / 3.0,
-        detail=(f"TVLP median F2 err={tvlp_med:.1f}Hz  "
-                f"Burg median F2 err={burg_med:.1f}Hz  "
-                f"threshold=Burg/3={burg_med/3.0:.1f}Hz  "
-                f"F0={F0:.0f}Hz jitter={JITTER_FRAC} N={N_SEEDS}"))
 #
 # When the caller supplies alpha directly there is no slope context,
 # so the returned slope must be NaN.
@@ -878,7 +783,6 @@ if __name__ == "__main__":
     test_path2_slope_passthrough()
     test_path2_path3_alpha_consistency()
     test_path2_nan_slope_no_raise()
-    test_tvlp_vs_burg_jitter()
 
     n_fail = _print_summary()
     raise SystemExit(0 if n_fail == 0 else 1)
