@@ -115,7 +115,7 @@ from .formants import (
 )
 
 # --- extractors ---
-from .extractors import FormantExtractor, PraatFormantExtractor, TVLPFormantExtractor
+from extractors import FormantExtractor, PraatFormantExtractor, TVLPFormantExtractor
 
 # --- pipeline ---
 from .pipeline import (

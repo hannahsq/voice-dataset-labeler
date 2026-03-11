@@ -19,8 +19,8 @@ class FormantExtractor(Protocol):
 
     Implementations
     ---------------
-    PraatFormantExtractor  (labeller.extractors.praat)
-    TVLPFormantExtractor   (labeller.extractors.tvlp)
+    PraatFormantExtractor  (extractors.praat)
+    TVLPFormantExtractor   (extractors.tvlp)
     """
     def __call__(
         self,

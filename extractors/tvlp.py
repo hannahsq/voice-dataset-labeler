@@ -14,12 +14,12 @@ from tvlp import extract_formants, _DEFAULT_LAMBDA, _DEFAULT_N_SUB, _DEFAULT_MAX
 class TVLPFormantExtractor:
     """
     Adapter that wraps tvlp.extract_formants, satisfying the FormantExtractor
-    protocol from labeller.extractors.
+    protocol from extractors.
 
     Usage::
 
         from labeller import label_dataset, LabellerConfig
-        from labeller.extractors import TVLPFormantExtractor
+        from extractors import TVLPFormantExtractor
 
         result = label_dataset(
             samples, LabellerConfig(),

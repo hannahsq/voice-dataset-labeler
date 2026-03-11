@@ -22,12 +22,11 @@ from .acoustic import (
     _blend_f0,
 )
 from .formants import (
-    _extract_raw_formants,
     _vtl_from_formants,
     _assign_formant_indices,
     VTLSmoother,
 )
-from .extractors import FormantExtractor, PraatFormantExtractor
+from extractors import FormantExtractor, PraatFormantExtractor
 
 
 # ---------------------------------------------------------------------------
