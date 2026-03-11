@@ -702,7 +702,7 @@ def test_tvlp_vs_burg_jitter():
             fn_norm=np.array(FN_NORM, dtype=np.float32),
             jitter_frac=JITTER_FRAC,
         )
-        audio, meta = generate_vowel(cfg, rng=np.random.default_rng(seed))
+        audio, meta = _generate_vowel(cfg, rng=np.random.default_rng(seed))
         truth_f2    = float(meta.formant_hz[1])
 
         # --- Burg: 25 ms window, standard Praat pre-emphasis ---
