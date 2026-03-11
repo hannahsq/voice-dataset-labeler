@@ -13,7 +13,7 @@ import numpy as np
 import parselmouth
 
 from .config import LabellerConfig, N_FORMANTS, SPEED_OF_SOUND_MM_S
-from .types import SpeakerMeta, Modality
+from .types import SpeakerMeta, Modality, FormantExtractor
 from .acoustic import (
     _loudness_dbfs,
     _periodicity,
@@ -26,6 +26,7 @@ from .formants import (
     _vtl_from_formants,
     _assign_formant_indices,
     VTLSmoother,
+    PraatFormantExtractor,
 )
 
 
@@ -37,6 +38,7 @@ def _extract_sample(
     sample: dict,
     cfg: LabellerConfig,
     vtl_smoother: VTLSmoother,
+    extractor: FormantExtractor,
 ) -> dict:
     """
     Slice one sample into overlapping windows and extract acoustic features.
@@ -111,8 +113,8 @@ def _extract_sample(
                                   int(np.floor(nyquist_hz / delta_f))))
         else:
             n_praat  = cfg.n_praat_formants
-        raw_freqs, raw_bws, slope = _extract_raw_formants(
-            frame, sr, cfg, win_s, dynamic_ceiling, n_formants=n_praat)
+        raw_freqs, raw_bws, slope = extractor(
+            frame, sr, win_s, max_formant_hz=dynamic_ceiling, n_formants=n_praat)
         vtl_raw      = _vtl_from_formants(raw_freqs)
         smoothed_vtl = vtl_smoother.smooth_vtl(group, speaker, vtl_raw)
         freqs_out, bws_out = _assign_formant_indices(raw_freqs, raw_bws, smoothed_vtl, nyquist_hz=sr / 2.0)
@@ -165,21 +167,21 @@ def _extract_sample(
 # Module-level picklable workers
 # ---------------------------------------------------------------------------
 
-def _worker_extract(args: tuple[dict, LabellerConfig, VTLSmoother]) -> dict:
+def _worker_extract(args: tuple[dict, LabellerConfig, VTLSmoother, FormantExtractor]) -> dict:
     """Extract one sample (parallel worker). Returns transposed sample dict."""
-    sample, cfg, smoother = args
-    return _extract_sample(sample, cfg, smoother)
+    sample, cfg, smoother, extractor = args
+    return _extract_sample(sample, cfg, smoother, extractor)
 
 
 def _worker_seed_vtl(
-    args: tuple[dict, LabellerConfig],
+    args: tuple[dict, LabellerConfig, FormantExtractor],
 ) -> tuple[str, str, float]:
     """
     Compute a robust median VTL estimate from up to 20 intensity-gated
     positions across a sample.  Used to seed the smoother before pass 0.
     Returns (group, speaker, median_vtl_mm).
     """
-    s, cfg   = args
+    s, cfg, extractor = args
     audio    = s["audio"].astype(np.float32)
     speaker  = s.get("speaker", "unknown")
     meta     = s.get("speaker_meta")
@@ -206,7 +208,7 @@ def _worker_seed_vtl(
 
     if not positions:
         n      = len(audio)
-        raw_f, _, _ = _extract_raw_formants(audio[n//4 : 3*n//4], sr, cfg, win_s)
+        raw_f, _, _ = extractor(audio[n//4 : 3*n//4], sr, win_s)
         return group, speaker, _vtl_from_formants(raw_f)
 
     win_samps = int(round(win_s * sr))
@@ -216,7 +218,7 @@ def _worker_seed_vtl(
         frame = audio[s0 : min(len(audio), s0 + win_samps)]
         if len(frame) < win_samps // 2:
             continue
-        raw_f, _, _ = _extract_raw_formants(frame, sr, cfg, win_s)
+        raw_f, _, _ = extractor(frame, sr, win_s)
         v = _vtl_from_formants(raw_f)
         if np.isfinite(v):
             vtls.append(v)
@@ -266,8 +268,9 @@ def _make_worker_args(
     samples: list[dict],
     cfg: LabellerConfig,
     smoother: VTLSmoother,
+    extractor: FormantExtractor,
 ) -> list[tuple]:
-    return [(s, cfg, smoother) for s in samples]
+    return [(s, cfg, smoother, extractor) for s in samples]
 
 
 # ---------------------------------------------------------------------------
@@ -277,6 +280,7 @@ def _make_worker_args(
 def label_dataset(
     samples: list[dict],
     cfg: Optional[LabellerConfig] = None,
+    extractor: Optional[FormantExtractor] = None,
     sr: int = 16000,
     verbose: bool = True,
 ) -> list[dict]:
@@ -285,10 +289,11 @@ def label_dataset(
 
     Parameters
     ----------
-    samples : list of dicts from dataset.py / datasets_hf.py
-    cfg     : LabellerConfig (uses defaults if None)
-    sr      : sample rate (used if not present in sample dict)
-    verbose : print progress
+    samples   : list of dicts from dataset.py / datasets_hf.py
+    cfg       : LabellerConfig (uses defaults if None)
+    extractor : FormantExtractor backend (uses PraatFormantExtractor if None)
+    sr        : sample rate (used if not present in sample dict)
+    verbose   : print progress
 
     Returns
     -------
@@ -302,6 +307,8 @@ def label_dataset(
     """
     if cfg is None:
         cfg = LabellerConfig()
+    if extractor is None:
+        extractor = PraatFormantExtractor(cfg)
 
     n_workers = _resolve_workers(cfg.n_jobs)
     for s in samples:
@@ -317,7 +324,7 @@ def label_dataset(
     if verbose:
         print("[labeller] Seeding VTL smoother...")
 
-    seed_args    = [(s, cfg) for s in samples]
+    seed_args    = [(s, cfg, extractor) for s in samples]
     if n_workers == 1:
         seed_results = [_worker_seed_vtl(a) for a in seed_args]
     else:
@@ -335,7 +342,7 @@ def label_dataset(
         print("[labeller] Pass 0 -- raw extraction...")
 
     pass0 = _parallel_map(
-        _make_worker_args(samples, cfg, smoother_raw),
+        _make_worker_args(samples, cfg, smoother_raw, extractor),
         n_workers, verbose, "pass0",
     )
 
@@ -353,7 +360,7 @@ def label_dataset(
         print(f"\n[labeller] Pass 1 -- refining VTL estimates...")
 
     pass1 = _parallel_map(
-        _make_worker_args(samples, cfg, smoother_first),
+        _make_worker_args(samples, cfg, smoother_first, extractor),
         n_workers, verbose, "pass1",
     )
 
@@ -382,7 +389,7 @@ def label_dataset(
         frozen._group_vtls[group]     = [final_vtl]
         if meta and isinstance(meta, SpeakerMeta) and meta.vtl_prior_mm is not None:
             frozen.register_speaker_override(speaker, meta.vtl_prior_mm)
-        frozen_args.append((dict(s), cfg, frozen))
+        frozen_args.append((dict(s), cfg, frozen, extractor))
 
     pass2 = _parallel_map(frozen_args, n_workers, verbose, "pass2")
 
@@ -422,6 +429,7 @@ def label_incremental(
     new_samples: list[dict],
     existing: list[dict],
     cfg: Optional[LabellerConfig] = None,
+    extractor: Optional[FormantExtractor] = None,
     sr: int = 16000,
     refine: bool = False,
     verbose: bool = True,
@@ -463,6 +471,8 @@ def label_incremental(
     """
     if cfg is None:
         cfg = LabellerConfig()
+    if extractor is None:
+        extractor = PraatFormantExtractor(cfg)
 
     for s in new_samples:
         s.setdefault("sr", sr)
@@ -493,7 +503,7 @@ def label_incremental(
     if verbose:
         print("[label_incremental] Seeding VTL for new speakers...")
 
-    seed_args    = [(s, cfg) for s in new_samples]
+    seed_args    = [(s, cfg, extractor) for s in new_samples]
     if n_workers == 1:
         seed_results = [_worker_seed_vtl(a) for a in seed_args]
     else:
@@ -529,7 +539,7 @@ def label_incremental(
         frozen._group_vtls[group]     = [final_vtl]
         if meta and isinstance(meta, SpeakerMeta) and meta.vtl_prior_mm is not None:
             frozen.register_speaker_override(speaker, meta.vtl_prior_mm)
-        frozen_args.append((dict(s), cfg, frozen))
+        frozen_args.append((dict(s), cfg, frozen, extractor))
 
     new_labelled = _parallel_map(frozen_args, n_workers, verbose, "incremental")
 
@@ -557,7 +567,7 @@ def label_incremental(
         return {k: v for k, v in s.items() if k not in _output_keys}
 
     combined_raw = [_strip(s) for s in existing] + list(new_samples)
-    return label_dataset(combined_raw, cfg=cfg, sr=sr, verbose=verbose)
+    return label_dataset(combined_raw, cfg=cfg, extractor=extractor, sr=sr, verbose=verbose)
 
 
 # ---------------------------------------------------------------------------
@@ -567,6 +577,7 @@ def label_incremental(
 def probe_raw_formants(
     samples: list[dict],
     cfg: Optional[LabellerConfig] = None,
+    extractor: Optional[FormantExtractor] = None,
     sr: int = 16000,
     verbose: bool = True,
 ) -> list[dict]:
@@ -601,6 +612,8 @@ def probe_raw_formants(
     """
     if cfg is None:
         cfg = LabellerConfig()
+    if extractor is None:
+        extractor = PraatFormantExtractor(cfg)
 
     for s in samples:
         s.setdefault("sr", sr)
@@ -671,7 +684,7 @@ def probe_raw_formants(
         if verbose:
             print(f"  probing speaker={speaker!r} group={group!r} "
                   f"label={s.get('label', '?')!r}")
-        result = _extract_sample(s, cfg, lit_smoother)
+        result = _extract_sample(s, cfg, lit_smoother, extractor)
         results.append(result)
 
     return results
@@ -680,6 +693,7 @@ def probe_raw_formants(
 def probe_full(
     samples: list[dict],
     cfg: Optional[LabellerConfig] = None,
+    extractor: Optional[FormantExtractor] = None,
     sr: int = 16000,
     speakers_per_group: int = 2,
     verbose: bool = True,
@@ -745,4 +759,4 @@ def probe_full(
             print(f"  {spk}: {len(vowels)} vowels ({', '.join(sorted(vowels))})")
         print(f"[probe_full] {len(selected)} samples total — running full pipeline...")
 
-    return label_dataset(selected, cfg=cfg, sr=sr, verbose=verbose)
+    return label_dataset(selected, cfg=cfg, extractor=extractor, sr=sr, verbose=verbose)

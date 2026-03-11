@@ -7,6 +7,9 @@ from __future__ import annotations
 import re
 import warnings
 from dataclasses import dataclass
+from typing import Optional, Protocol, runtime_checkable
+
+import numpy as np
 
 from .config import (
     VALID_MODALITY,
@@ -16,6 +19,27 @@ from .config import (
     _AGE_CHILD_MAX,
     _AGE_TEEN_MAX,
 )
+
+
+@runtime_checkable
+class FormantExtractor(Protocol):
+    """
+    Protocol for formant extractor backends.
+
+    Any callable class that accepts (frame, sr, win_s, max_formant_hz, n_formants)
+    and returns (freqs, bws, spectral_slope) satisfies this protocol.
+
+    Both PraatFormantExtractor (labeller.formants) and TVLPFormantExtractor
+    (tvlp) conform to this interface.
+    """
+    def __call__(
+        self,
+        frame: np.ndarray,
+        sr: int,
+        win_s: float,
+        max_formant_hz: Optional[float] = None,
+        n_formants: Optional[int] = None,
+    ) -> tuple[np.ndarray, np.ndarray, float]: ...
 
 
 @dataclass
