@@ -10,7 +10,38 @@ import numpy as np
 import parselmouth
 from parselmouth.praat import call
 
-from spectral import estimate_spectral_tilt_alpha, apply_preemphasis
+def _estimate_spectral_tilt_alpha(frame: np.ndarray, sr: int) -> tuple[float, float]:
+    """Estimate spectral tilt (dB/oct) and matched pre-emphasis alpha. Returns (slope, alpha); NaN on failure."""
+    try:
+        w     = np.hanning(len(frame))
+        mag   = np.abs(np.fft.rfft(frame * w)) + 1e-12
+        freqs = np.fft.rfftfreq(len(frame), 1.0 / sr)
+        mask  = (freqs >= 300) & (freqs <= 4000)
+        if mask.sum() < 4:
+            return np.nan, np.nan
+        x_log = np.log2(freqs[mask])
+        A     = np.vstack([x_log, np.ones_like(x_log)]).T
+        slope, _ = np.linalg.lstsq(A, 20.0 * np.log10(mag[mask]), rcond=None)[0]
+        target       = -slope
+        w12          = 2.0 * np.pi * np.array([500.0, 4000.0]) / sr
+        desired_diff = target * np.log2(4000.0 / 500.0)
+        best_alpha, best_err = 0.95, 1e9
+        for alpha in np.linspace(0.70, 0.99, 300):
+            H    = np.abs(1.0 - alpha * np.exp(-1j * w12))
+            diff = 20.0 * np.log10(H[1] / H[0])
+            if (err := abs(diff - desired_diff)) < best_err:
+                best_err, best_alpha = err, alpha
+        return float(slope), float(best_alpha)
+    except Exception:
+        return np.nan, np.nan
+
+
+def _apply_preemphasis(x: np.ndarray, alpha: float) -> np.ndarray:
+    """First-order pre-emphasis: y[n] = x[n] - alpha * x[n-1]."""
+    y     = np.empty_like(x)
+    y[0]  = x[0]
+    y[1:] = x[1:] - alpha * x[:-1]
+    return y
 
 
 class PraatFormantExtractor:
@@ -68,10 +99,10 @@ class PraatFormantExtractor:
         analysis       = frame.astype(np.float32)
 
         if self.adaptive_preemphasis:
-            slope, alpha   = estimate_spectral_tilt_alpha(frame, sr)
+            slope, alpha   = _estimate_spectral_tilt_alpha(frame, sr)
             spectral_slope = slope
             if np.isfinite(alpha):
-                analysis = apply_preemphasis(frame, alpha).astype(np.float32)
+                analysis = _apply_preemphasis(frame, alpha).astype(np.float32)
             praat_preemph = 20_000.0       # above Nyquist — disables Praat's filter
         else:
             praat_preemph = self.preemphasis_from_hz

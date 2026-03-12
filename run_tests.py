@@ -8,8 +8,8 @@ Usage (from project root):
 
 Suites
 ------
-  tests/test_labeller.py   — labeller regression tests (R01-R10, includes synth)
-  test_tvlp.py             — TVLP formant estimator contract tests
+  labeller/tests/test_labeller.py   — labeller regression tests (R01-R10, includes synth)
+  extractors/tests/test_tvlp.py     — TVLP formant estimator contract tests
 
 Each suite runs in its own subprocess so their independent result registries
 don't interfere.  Exit code is 0 only if every suite passes.
@@ -24,8 +24,8 @@ from pathlib import Path
 ROOT = Path(__file__).parent
 
 SUITES = [
-    ("labeller",  ROOT / "tests" / "test_labeller.py"),
-    ("tvlp",      ROOT / "test_tvlp.py"),
+    ("labeller",  ROOT / "labeller"   / "tests" / "test_labeller.py"),
+    ("tvlp",      ROOT / "extractors" / "tests" / "test_tvlp.py"),
 ]
 
 

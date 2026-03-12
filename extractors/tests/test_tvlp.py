@@ -21,10 +21,15 @@ table. No early raises.
 from __future__ import annotations
 
 import math
+import sys
 import traceback
+from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+# Project root — needed to import extractors and synth
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 # ---------------------------------------------------------------------------
 # Test registry
@@ -121,8 +126,9 @@ def _constant(val: float = 0.5, duration_s: float = 0.1, sr: int = SR) -> np.nda
 # ---------------------------------------------------------------------------
 
 try:
-    import tvlp
+    import extractors.tvlp as tvlp
     _IMPORT_OK = True
+    _IMPORT_ERR = ""
 except Exception as e:
     _IMPORT_OK = False
     _IMPORT_ERR = traceback.format_exc()
@@ -172,12 +178,6 @@ def test_output_contract():
 
 # ---------------------------------------------------------------------------
 # T03  Pure sine → pole near tone frequency  [THEORY]
-#
-# A sine at frequency f produces an LP pole at z = exp(±j*2π*f/sr).
-# After root finding, the pole frequency should be within delta_F/4 of f.
-# delta_F for VTL~160mm ≈ 350000/(2*160) ≈ 1094 Hz, so tol = 273 Hz.
-# We use a tighter absolute tolerance of 100 Hz as a reasonable expectation
-# for a windowed estimator.
 # ---------------------------------------------------------------------------
 
 def test_single_pole():
@@ -185,7 +185,7 @@ def test_single_pole():
         _check("T03_single_pole_found",   False, "skipped"); return
 
     TARGET_HZ = 800.0
-    TOL_HZ    = 100.0        # THEORY: LP pole should be within 100 Hz of true freq
+    TOL_HZ    = 100.0
 
     audio = _sine(TARGET_HZ, duration_s=0.4)
     freqs, bws, _ = tvlp.extract_formants(audio, sr=SR, n_formants=7)
@@ -203,9 +203,6 @@ def test_single_pole():
 
 # ---------------------------------------------------------------------------
 # T04  Two sines → two poles near their frequencies  [THEORY]
-#
-# Two sinusoids sufficiently separated (> delta_F) should each produce a pole.
-# We use 600 Hz and 1400 Hz, separation = 800 Hz.
 # ---------------------------------------------------------------------------
 
 def test_two_poles():
@@ -306,12 +303,6 @@ def test_constant():
 
 # ---------------------------------------------------------------------------
 # T08  Temporal smoothness: higher regularisation → smoother LP coefficients
-#       [EMPIRICAL]
-#
-# We call the lower-level tvlp.fit_tvlp() directly, which returns the
-# (n_subframes, order) coefficient matrix.  With lambda_smooth=0 (no
-# regularisation) the coefficients should vary more across sub-frames than
-# with a high lambda.  We measure this as the mean std across coefficients.
 # ---------------------------------------------------------------------------
 
 def test_regularisation_smoothness():
@@ -334,7 +325,6 @@ def test_regularisation_smoothness():
         _check("T08_smooth_gt_nosmooth", False, f"fit_tvlp raised: {e}")
         return
 
-    # Mean std across sub-frames, averaged over LP coefficients
     std_free   = float(np.mean(np.std(coeffs_free,   axis=0)))
     std_smooth = float(np.mean(np.std(coeffs_smooth, axis=0)))
 
@@ -382,7 +372,7 @@ def test_bw_defined_where_freq_defined():
 
 
 # ---------------------------------------------------------------------------
-# Synth-based tests — use exact ground truth from synth.py
+# Synth-based tests — use exact ground truth from synth
 # ---------------------------------------------------------------------------
 
 try:
@@ -409,13 +399,6 @@ def _synth_vowel(
 
 # ---------------------------------------------------------------------------
 # T11  Low-F0 neutral vowel: F1 accuracy  [THEORY]
-#
-# At F0=80 Hz, harmonics are at 80, 160, 240, ... Hz.
-# F1 at ~540 Hz (neutral VTL=162mm, fn_norm=1.0) has ~6 harmonics below it.
-# LP should track F1 to within 100 Hz with pre-emphasis.
-#
-# Tolerance rationale: delta_F ≈ 540 Hz, so 100 Hz ≈ delta_F/5.
-# This is achievable as confirmed by empirical sweep above (~50 Hz typical).
 # ---------------------------------------------------------------------------
 
 def test_synth_f1_low_f0():
@@ -429,7 +412,7 @@ def test_synth_f1_low_f0():
     freqs, _, _ = tvlp.extract_formants(audio, sr=SR, n_formants=3)
 
     truth_f1 = float(meta.formant_hz[0])
-    TOL_HZ   = 100.0   # THEORY: delta_F/5 for a well-behaved LP at low F0
+    TOL_HZ   = 100.0
 
     finite = freqs[np.isfinite(freqs)]
     nearest = float(np.min(np.abs(finite - truth_f1))) if len(finite) else np.inf
@@ -443,10 +426,6 @@ def test_synth_f1_low_f0():
 
 # ---------------------------------------------------------------------------
 # T12  Low-F0 neutral vowel: F1+F2 both found within tolerance  [THEORY]
-#
-# At F0=80 Hz with a neutral vowel (fn_norm=[1,3,5]) both F1 and F2 should
-# be recoverable. Tolerance is tighter for F1 (100 Hz) and looser for F2
-# (200 Hz) reflecting that higher formants accumulate more LP estimation error.
 # ---------------------------------------------------------------------------
 
 def test_synth_f1_f2_low_f0():
@@ -473,11 +452,6 @@ def test_synth_f1_f2_low_f0():
 
 # ---------------------------------------------------------------------------
 # T13  High-F0 stability: output is finite, in-range, no crash  [EMPIRICAL]
-#
-# At F0=500 Hz (soprano singing range) LP accuracy degrades but the estimator
-# must not crash or produce physically implausible values.
-# We do NOT assert accuracy here — that's the TCN's job.
-# We assert: at least one finite pole, all finite poles in [50, Nyquist].
 # ---------------------------------------------------------------------------
 
 def test_synth_high_f0_stable():
@@ -516,10 +490,6 @@ def test_synth_high_f0_stable():
 
 # ---------------------------------------------------------------------------
 # T14  Regularisation improves F1 accuracy vs unregularised LP  [EMPIRICAL]
-#
-# With a low-F0 vowel and pre-emphasis, lambda=2.0 should give lower F1 error
-# than lambda=0.0.  This directly tests the core value proposition of TVLP.
-# We allow lambda=0.0 to still be within 300 Hz (it just shouldn't be better).
 # ---------------------------------------------------------------------------
 
 def test_regularisation_improves_accuracy():
@@ -549,96 +519,7 @@ def test_regularisation_improves_accuracy():
 
 
 # ---------------------------------------------------------------------------
-# T19  TVLP vs Praat Burg: F2 accuracy at singing-range F0  [EMPIRICAL]
-#
-# Motivation
-# ----------
-# At F0=150 Hz (lower soprano / mezzo singing range), harmonics are spaced
-# 150 Hz apart while formant spacing (delta_F) for a ~162mm VTL is ~540 Hz.
-# A short-window Burg estimator sees only ~3 harmonics per formant and tends
-# to lock onto individual partials rather than the resonance envelope — F2
-# errors of 400+ Hz are typical.  TVLP's longer analysis window and temporal
-# regularisation recover the resonance structure: errors of ~15 Hz.
-#
-# Test design
-# -----------
-# Neutral vowel (fn_norm=[1,3,5]), VTL=162mm, F0=150Hz, N=10 independent
-# seeds (jitter/shimmer variation).  We measure the error on F2 specifically
-# because:
-#   - F1 is close to the 2nd harmonic (300Hz) so both methods can find it
-#   - F2 at ~1620Hz falls between harmonics 10 and 11 — the hard case
-#   - F3 is in the upper region where both methods degrade; not informative
-#
-# Assertion: TVLP median F2 error < Burg median F2 error / 2.
-# The actual ratio observed empirically is ~0.03 (33× better), so the ÷2
-# threshold is deliberately conservative to avoid flakiness on real Praat
-# output (which may differ slightly from the Python LP approximation used
-# during development).
-#
-# What this test does NOT claim
-# ------------------------------
-# - TVLP is not better than Burg at all F0s (at F0≥400Hz both methods
-#   degrade similarly; that regime is the TCN's job)
-# - TVLP is not better on F3+ at any F0 tested
-# - The comparison uses parselmouth's actual Burg implementation, not an
-#   approximation, so results reflect the real integration target
-#
-# Requires: parselmouth  (skipped gracefully if not installed)
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# T19  [RETIRED] — TVLP vs Praat Burg comparative accuracy
-#
-# We attempted to construct a synthetic test condition where TVLP reliably
-# outperforms Praat's Burg estimator.  Two hypotheses were tested and both
-# were falsified by empirical measurement against real parselmouth output:
-#
-# Hypothesis 1 — jitter disrupts harmonic anchoring
-# --------------------------------------------------
-# At F0=150 Hz, the 11th harmonic falls ~30 Hz from F2, and we hypothesised
-# that period-to-period jitter would smear this harmonic, hurting Burg while
-# TVLP's longer window averaged through the variation.  In practice:
-#   - jitter_frac=0.05: TVLP 28.7 Hz, Burg 3.8 Hz  (Burg wins decisively)
-# Burg is robust to mild jitter because Praat's internal formant tracker
-# already averages estimates across frames.
-#
-# Hypothesis 2 — synthetic vibrato (periodic F0 modulation) disrupts Burg
-# -------------------------------------------------------------------------
-# A 100-cent vibrato sweep causes harmonics to sweep through the formant
-# frequency, which we hypothesised would confuse a short-window estimator.
-# In practice, vibrato *improves* Praat Burg (F0=150, rate=20Hz: 5.4 Hz error)
-# because each harmonic sweeps through the formant repeatedly, and Praat's
-# time-averaging of formant *estimates* across frames integrates those sweeps
-# into a stable resonance estimate.  TVLP, averaging LP *coefficients* before
-# pole extraction, sees a smeared autocorrelation and gets worse:
-#   rate=0 Hz:  Burg 21.7 Hz, TVLP 22.7 Hz  (tie)
-#   rate=10 Hz: Burg  8.6 Hz, TVLP 103.0 Hz (Burg wins decisively)
-#   rate=20 Hz: Burg  5.4 Hz, TVLP  79.7 Hz (Burg wins decisively)
-#
-# Root cause
-# ----------
-# TVLP smooths LP coefficients across time; Praat smooths formant track
-# estimates across time.  Smoothing after pole extraction is architecturally
-# more robust to F0 modulation than smoothing before it.  The correct fix is
-# a redesign: run short-window LP frames, extract poles per frame, then apply
-# a Kalman-style smoother to the pole *trajectories* with the VTL prior as
-# the process model.  This is also a more natural integration point for the
-# TCN, which can provide per-frame formant estimates with uncertainty to feed
-# the smoother.
-#
-# Current status
-# --------------
-# TVLP in its present form is a useful complement to Burg for non-modulated
-# or mildly noisy signals (T11-T14 show it works well at low F0 on clean
-# synthetic vowels).  A comparative advantage over Praat on voiced singing
-# has not been demonstrated on synthetic signals and should be evaluated
-# on real recordings where source irregularity is less clean than the
-# synth model.  The pole-trajectory smoother redesign is tracked as a
-# future direction.
-# ---------------------------------------------------------------------------
-#
-# When the caller supplies alpha directly there is no slope context,
-# so the returned slope must be NaN.
+# T15  Path 1 — explicit alpha: returned slope must be NaN
 # ---------------------------------------------------------------------------
 
 def test_path1_explicit_alpha():
@@ -663,9 +544,6 @@ def test_path1_explicit_alpha():
 
 # ---------------------------------------------------------------------------
 # T16  Path 2 — slope passed from labeller: returned slope matches input [EXACT]
-#
-# When spectral_slope is provided, the returned slope must be the same value
-# (not recomputed).  This is the integration contract with _extract_sample.
 # ---------------------------------------------------------------------------
 
 def test_path2_slope_passthrough():
@@ -675,7 +553,7 @@ def test_path2_slope_passthrough():
         return
 
     audio          = _sine(800.0)
-    LABELLER_SLOPE = -12.34   # arbitrary sentinel value
+    LABELLER_SLOPE = -12.34
 
     _, _, slope_out = tvlp.extract_formants(audio, sr=SR, n_formants=7,
                                              spectral_slope=LABELLER_SLOPE)
@@ -692,12 +570,6 @@ def test_path2_slope_passthrough():
 
 # ---------------------------------------------------------------------------
 # T17  Path 2 vs Path 3 alpha consistency  [THEORY]
-#
-# _alpha_from_slope(slope, sr) must produce the same alpha as the second
-# half of _estimate_slope_and_alpha() for the same slope value.
-# We verify this indirectly: run path 3 on a frame, capture slope_3;
-# then run path 2 with spectral_slope=slope_3.  The pre-emphasised signals
-# must be identical, so the returned formants should match to float32 precision.
 # ---------------------------------------------------------------------------
 
 def test_path2_path3_alpha_consistency():
@@ -717,7 +589,6 @@ def test_path2_path3_alpha_consistency():
     freqs2, _, _ = tvlp.extract_formants(audio, sr=SR, n_formants=5,
                                           spectral_slope=slope3)
 
-    # Both paths should produce identical formants (same alpha, same frame)
     both_nan  = np.isnan(freqs2) & np.isnan(freqs3)
     both_fin  = np.isfinite(freqs2) & np.isfinite(freqs3)
     close     = np.allclose(freqs2[both_fin], freqs3[both_fin], atol=0.1)
@@ -731,10 +602,6 @@ def test_path2_path3_alpha_consistency():
 
 # ---------------------------------------------------------------------------
 # T18  Path 2 with slope=NaN suppresses pre-emphasis gracefully  [EXACT]
-#
-# The labeller sets spectral_slope=NaN when adaptive pre-emphasis estimation
-# fails (e.g. very short or pathological frames).  extract_formants must not
-# raise and should still attempt pole extraction without pre-emphasis.
 # ---------------------------------------------------------------------------
 
 def test_path2_nan_slope_no_raise():

@@ -17,8 +17,8 @@ import traceback
 import unittest.mock as mock
 from pathlib import Path
 
-# Add project root to path so labeller and synth are importable from tests/
-sys.path.insert(0, str(Path(__file__).parent.parent))
+# Add project root to path so labeller and synth are importable from labeller/tests/
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 # Mock heavy imports before labeller is touched
 for _mod in ("parselmouth", "parselmouth.praat", "librosa"):
