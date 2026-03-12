@@ -2,13 +2,10 @@
 """
 Synthetic vowel generator for TCN formant estimator training data.
 
-Generates voiced vowel-like signals using a simple but physically grounded
-source-filter model:
+Generates voiced vowel-like signals using pluggable backends:
 
-  Source : band-limited impulse train (glottal pulse approximation)
-           with per-period jitter and shimmer for naturalness
-  Filter : cascade of 2nd-order resonators, one per formant (all-pole)
-  Output : float32 audio at a specified sample rate
+  "klatt"          — cascade of 2nd-order resonators (source-filter)
+  "kelly_lochbaum" — Kelly-Lochbaum waveguide with source-filter coupling
 
 The generator covers the full physiologically plausible F1/F2 space uniformly
 rather than targeting any particular dialect or speaker group.  This makes it
@@ -17,20 +14,10 @@ a good complement to real-data fine-tuning: broad coverage + exact ground truth.
 Ground-truth parameterisation
 ------------------------------
 Formants are parameterised as normalised values relative to delta_F = c/(4L),
-so fn_norm[n] = Fn / delta_F ≈ (2n-1) for a neutral vowel.  The generator
-accepts either Hz or normalised values (see SynthParams).
-
-The same delta_F convention as labeller.py is used:
+so fn_norm[n] = Fn / delta_F ≈ (2n-1) for a neutral vowel.  The same
+delta_F convention as labeller.py is used:
     delta_F = SPEED_OF_SOUND_MM_S / (4 * vtl_mm)
     Fn_uniform = (2n-1) * delta_F  →  fn_norm = Fn / delta_F = 2n-1
-
-Bandwidth model
----------------
-Bandwidths are generated from a simple empirical model adapted from
-Fant (1960) and Hawks & Miller (1995):
-    Bn ≈ base_bw * (1 + Fn / bw_slope_hz)
-with added per-formant noise.  Bandwidths are always positive and are
-also returned normalised as bn_norm = Bn / delta_F.
 
 Usage
 -----
@@ -43,9 +30,8 @@ Usage
 
 from __future__ import annotations
 
-import warnings
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass
+from typing import Any, Optional
 
 import numpy as np
 
@@ -90,6 +76,9 @@ SHIMMER_FRAC: float = 0.03    # period-to-period amplitude variation (fraction)
 # Configuration
 # ---------------------------------------------------------------------------
 
+_VALID_BACKENDS = ("klatt", "kelly_lochbaum")
+
+
 @dataclass
 class SynthConfig:
     sr:             int   = 16_000   # output sample rate (Hz)
@@ -103,6 +92,8 @@ class SynthConfig:
     shimmer_frac:   float = SHIMMER_FRAC
     amplitude:      float = 0.5      # peak amplitude of output (0–1)
     rng_seed:       Optional[int] = None
+    backend:        str   = "klatt"            # "klatt" | "kelly_lochbaum"
+    backend_cfg:    Optional[Any] = None       # KLConfig | None
 
     def __post_init__(self):
         if self.n_formants > len(FN_NORM_BOUNDS):
@@ -112,126 +103,10 @@ class SynthConfig:
             )
         if not (0.0 < self.amplitude <= 1.0):
             raise ValueError(f"amplitude={self.amplitude} must be in (0, 1]")
-
-
-# ---------------------------------------------------------------------------
-# Synthesis helpers
-# ---------------------------------------------------------------------------
-
-def _delta_f(vtl_mm: float) -> float:
-    """ΔF = c/(4L) — the uniform tube half-spacing (Hz)."""
-    return SPEED_OF_SOUND_MM_S / (4.0 * vtl_mm)
-
-
-def _formant_hz_from_norm(fn_norm: np.ndarray, vtl_mm: float) -> np.ndarray:
-    """Convert normalised formant values to Hz."""
-    return (fn_norm * _delta_f(vtl_mm)).astype(np.float32)
-
-
-def _bandwidth_hz(formant_hz: np.ndarray, rng: np.random.Generator) -> np.ndarray:
-    """
-    Generate bandwidths from a simple empirical model with additive noise.
-    Always returns strictly positive values.
-    """
-    bw = BW_BASE_HZ + BW_SLOPE * formant_hz
-    bw = bw + rng.normal(0.0, BW_NOISE_HZ, size=bw.shape).astype(np.float32)
-    return np.clip(bw, 20.0, None).astype(np.float32)
-
-
-def _resonator_coeffs(
-    f_hz: float,
-    bw_hz: float,
-    sr: int,
-) -> tuple[float, float, float, float, float]:
-    """
-    Compute IIR coefficients for a 2nd-order resonator (all-pole bandpass).
-
-    Transfer function:  H(z) = 1 / (1 - 2R*cos(θ)*z⁻¹ + R²*z⁻²)
-    where θ = 2π*f/sr,  R = exp(-π*bw/sr).
-
-    Returns (b0, a1, a2) for  y[n] = b0*x[n] + a1*y[n-1] + a2*y[n-2]
-    with b0 chosen so DC gain = 1 (normalised).
-    """
-    theta = 2.0 * np.pi * f_hz / sr
-    R     = np.exp(-np.pi * bw_hz / sr)
-    a1    =  2.0 * R * np.cos(theta)
-    a2    = -R * R
-    # DC gain = 1 / (1 - a1 - a2); normalise so resonator has unit DC gain
-    dc    = 1.0 - a1 - a2
-    b0    = dc if abs(dc) > 1e-12 else 1.0
-    return b0, a1, a2
-
-
-def _apply_resonator(
-    x: np.ndarray,
-    f_hz: float,
-    bw_hz: float,
-    sr: int,
-) -> np.ndarray:
-    """Apply a single 2nd-order resonator in-place via direct-form II."""
-    b0, a1, a2 = _resonator_coeffs(f_hz, bw_hz, sr)
-    y   = np.zeros_like(x)
-    y1  = 0.0
-    y2  = 0.0
-    for i, xn in enumerate(x):
-        yn   = b0 * xn + a1 * y1 + a2 * y2
-        y[i] = yn
-        y2   = y1
-        y1   = yn
-    return y
-
-
-def _glottal_source(
-    n_samples:    int,
-    sr:           int,
-    f0_hz:        float,
-    jitter_frac:  float,
-    shimmer_frac: float,
-    rng:          np.random.Generator,
-) -> np.ndarray:
-    """
-    Generate a band-limited impulse train approximating a glottal pulse train.
-
-    Each period is a raised-cosine pulse (smoother than a Dirac, avoids
-    aliasing at high F0) with per-period jitter (timing) and shimmer
-    (amplitude).
-    """
-    x        = np.zeros(n_samples, dtype=np.float64)
-    period   = sr / f0_hz
-    t        = 0.0
-    amp      = 1.0
-
-    # Width of raised-cosine pulse: 1/3 of period, minimum 3 samples
-    pulse_width = max(3, int(round(period / 3.0)))
-
-    half = pulse_width // 2
-    pulse_template = 0.5 * (1.0 - np.cos(
-        2.0 * np.pi * np.arange(pulse_width) / (pulse_width - 1)
-    ))
-
-    while t < n_samples:
-        pos = int(round(t))
-        if pos >= n_samples:
-            break
-
-        # Write pulse centred at pos, clipped to array bounds
-        start = pos - half
-        end   = start + pulse_width
-        a0    = max(0, -start)
-        a1    = pulse_width - max(0, end - n_samples)
-        s0    = max(0, start)
-        s1    = s0 + (a1 - a0)
-        x[s0:s1] += amp * pulse_template[a0:a1]
-
-        # Advance by one period with jitter
-        jitter = rng.normal(0.0, jitter_frac * period)
-        t     += period + jitter
-
-        # Shimmer
-        amp *= 1.0 + rng.normal(0.0, shimmer_frac)
-        amp  = np.clip(amp, 0.2, 2.0)
-
-    return x.astype(np.float32)
+        if self.backend not in _VALID_BACKENDS:
+            raise ValueError(
+                f"backend={self.backend!r} must be one of {_VALID_BACKENDS}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -241,15 +116,27 @@ def _glottal_source(
 @dataclass
 class VowelMeta:
     """Ground-truth metadata for a synthetic vowel clip."""
-    sr:           int
-    f0_hz:        float
-    vtl_mm:       float
-    delta_f_hz:   float             # c/(4L)
-    formant_hz:   np.ndarray        # (n_formants,) float32
-    formant_bw_hz: np.ndarray       # (n_formants,) float32
-    fn_norm:      np.ndarray        # formant_hz / delta_f_hz
-    bn_norm:      np.ndarray        # formant_bw_hz / delta_f_hz
-    duration_s:   float
+    sr:              int
+    f0_hz:           float
+    vtl_mm:          float
+    delta_f_hz:      float             # c/(4L)
+    formant_hz:      np.ndarray        # (n_formants,) float32
+    formant_bw_hz:   np.ndarray        # (n_formants,) float32
+    fn_norm:         np.ndarray        # formant_hz / delta_f_hz
+    bn_norm:         np.ndarray        # formant_bw_hz / delta_f_hz
+    duration_s:      float
+    # Optional KL-specific metadata
+    register:        Optional[str]   = None
+    effort:          Optional[str]   = None
+    phonation_type:  Optional[str]   = None
+    glottal_gap_frac: Optional[float] = None
+    spectral_slope:  Optional[float] = None
+    loudness_dbfs:   Optional[float] = None
+
+
+def _delta_f(vtl_mm: float) -> float:
+    """ΔF = c/(4L) — the uniform tube half-spacing (Hz)."""
+    return SPEED_OF_SOUND_MM_S / (4.0 * vtl_mm)
 
 
 def generate_vowel(
@@ -268,12 +155,17 @@ def generate_vowel(
         seed = cfg.rng_seed if cfg.rng_seed is not None else None
         rng  = np.random.default_rng(seed)
 
-    # --- Sample F0 and VTL ---
+    # --- KL backend handles its own parameter sampling ---
+    if cfg.backend == "kelly_lochbaum":
+        from synth.kl import generate_vowel_kl
+        return generate_vowel_kl(cfg, rng)
+
+    # --- Klatt path: sample F0, VTL, formants, bandwidths, then delegate ---
     f0_hz  = cfg.f0_hz  if cfg.f0_hz  is not None else float(rng.uniform(F0_MIN_HZ, F0_MAX_HZ))
     vtl_mm = cfg.vtl_mm if cfg.vtl_mm is not None else float(rng.uniform(VTL_MIN_MM, VTL_MAX_MM))
     df     = _delta_f(vtl_mm)
 
-    # --- Sample normalised formants ---
+    # Sample normalised formants
     if cfg.fn_norm is not None:
         fn_norm = np.asarray(cfg.fn_norm, dtype=np.float32)
     else:
@@ -292,48 +184,19 @@ def generate_vowel(
                     max(min_val + 0.1, float(FN_NORM_BOUNDS[i, 1]))
                 ))
 
+    from synth.klatt import _formant_hz_from_norm, _bandwidth_hz
+
     formant_hz = _formant_hz_from_norm(fn_norm, vtl_mm)
 
-    # --- Sample bandwidths ---
+    # Sample bandwidths
     if cfg.bw_hz is not None:
         bw_hz = np.asarray(cfg.bw_hz, dtype=np.float32)
     else:
         bw_hz = _bandwidth_hz(formant_hz, rng)
 
-    bn_norm = (bw_hz / df).astype(np.float32)
-
-    # --- Synthesise ---
-    n_samples = int(round(cfg.sr * cfg.duration_s))
-    source    = _glottal_source(n_samples, cfg.sr, f0_hz,
-                                cfg.jitter_frac, cfg.shimmer_frac, rng)
-
-    # Cascade resonators (source -> F1 -> F2 -> ... -> FN)
-    signal = source.copy()
-    for i in range(cfg.n_formants):
-        signal = _apply_resonator(signal, float(formant_hz[i]),
-                                  float(bw_hz[i]), cfg.sr)
-
-    # Normalise amplitude
-    peak = np.max(np.abs(signal))
-    if peak > 1e-9:
-        signal = (signal / peak * cfg.amplitude).astype(np.float32)
-    else:
-        warnings.warn("Synthesised signal has near-zero amplitude; check parameters.")
-        signal = signal.astype(np.float32)
-
-    meta = VowelMeta(
-        sr            = cfg.sr,
-        f0_hz         = f0_hz,
-        vtl_mm        = vtl_mm,
-        delta_f_hz    = df,
-        formant_hz    = formant_hz,
-        formant_bw_hz = bw_hz,
-        fn_norm       = fn_norm,
-        bn_norm       = bn_norm,
-        duration_s    = n_samples / cfg.sr,
-    )
-
-    return signal, meta
+    from synth.klatt import generate_vowel_klatt
+    return generate_vowel_klatt(cfg, rng, f0_hz, vtl_mm, df,
+                                fn_norm, formant_hz, bw_hz)
 
 
 def generate_dataset(
@@ -363,6 +226,8 @@ def generate_dataset(
         jitter_frac  = cfg.jitter_frac,
         shimmer_frac = cfg.shimmer_frac,
         amplitude    = cfg.amplitude,
+        backend      = cfg.backend,
+        backend_cfg  = cfg.backend_cfg,
     )
 
     rng     = np.random.default_rng(seed)

@@ -26,6 +26,7 @@ ROOT = Path(__file__).parent
 SUITES = [
     ("labeller",  ROOT / "labeller"   / "tests" / "test_labeller.py"),
     ("tvlp",      ROOT / "extractors" / "tests" / "test_tvlp.py"),
+    ("synth_kl",  ROOT / "synth"      / "tests" / "test_synth_kl.py"),
 ]
 
 
