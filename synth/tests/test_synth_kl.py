@@ -76,8 +76,9 @@ def _build_system_matrix(
         M[row_bwd, col_fwd]  = kn
         M[row_bwd, col_bwd1] = 1.0 - kn
 
-    # Glottal boundary: total reflection (Ug=0) → p⁺₀[t+1] = p⁻₀[t]
-    M[0, N] = 1.0
+    # Glottal boundary: Ug=0, so GL-3 gives p⁺₀[t+1] = p⁻₀[t] / 2
+    # (the ρc·Ug/(2A₀) term vanishes, leaving p⁻₀[t-1]/2)
+    M[0, N] = 0.5
 
     # Lip boundary: p⁻_{N-1}[t+1] = −r_lip · p⁺_{N-1}[t]
     M[2 * N - 1, N - 1] = -r_lip
@@ -274,6 +275,7 @@ def test_r12_energy_conservation():
         r = abs(e_curr - e_prev
                 - power_in(p_fwd_hist[t], p_bwd_hist[t])
                 + power_out(p_fwd_hist[t], p_bwd_hist[t]))
+        print(f"e_prev: {e_prev}, e_curr: {e_curr}, r: {r}, power_in: {power_in(p_fwd_hist[t], p_bwd_hist[t])}, power_out: {power_out(p_fwd_hist[t], p_bwd_hist[t])}")
         max_residual = max(max_residual, r)
         e_prev = e_curr
 

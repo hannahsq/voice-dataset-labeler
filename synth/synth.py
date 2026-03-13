@@ -55,6 +55,8 @@ FN_NORM_BOUNDS: np.ndarray = np.array([
     [3.50, 8.00],   # F3
     [5.50, 11.0],   # F4
     [8.00, 14.0],   # F5
+    [10.0, 15.0],   # F6
+    [12.0, 17.0],   # F7
 ], dtype=np.float32)
 
 # Bandwidth model: Bn ≈ base_bw_hz + slope * Fn
@@ -187,6 +189,7 @@ def generate_vowel(
     from synth.klatt import _formant_hz_from_norm, _bandwidth_hz
 
     formant_hz = _formant_hz_from_norm(fn_norm, vtl_mm)
+    print(formant_hz)
 
     # Sample bandwidths
     if cfg.bw_hz is not None:
@@ -197,6 +200,69 @@ def generate_vowel(
     from synth.klatt import generate_vowel_klatt
     return generate_vowel_klatt(cfg, rng, f0_hz, vtl_mm, df,
                                 fn_norm, formant_hz, bw_hz)
+
+
+def save_vowel_wav(
+    path: str,
+    cfg: SynthConfig,
+    rng: Optional[np.random.Generator] = None,
+) -> tuple[np.ndarray, "VowelMeta"]:
+    """
+    Generate a synthetic vowel and save it as a WAV file.
+
+    Parameters
+    ----------
+    path : destination file path (e.g. "out/vowel.wav")
+    cfg  : SynthConfig
+    rng  : optional RNG (seeded from cfg.rng_seed if omitted)
+
+    Returns
+    -------
+    audio, meta — same as generate_vowel
+    """
+    import os
+    import wave
+    audio, meta = generate_vowel(cfg, rng=rng)
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    pcm = (audio * 32767).clip(-32768, 32767).astype(np.int16)
+    with wave.open(path, "w") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(cfg.sr)
+        wf.writeframes(pcm.tobytes())
+    return audio, meta
+
+def save_glottal_source_wav(
+    path: str,
+    cfg: SynthConfig,
+    rng: Optional[np.random.Generator] = None,
+) -> tuple[np.ndarray, "VowelMeta"]:
+    """
+    Generate a synthetic glottal source waveform and save it as a WAV file.
+
+    Parameters
+    ----------
+    path : destination file path (e.g. "out/vowel.wav")
+    cfg  : SynthConfig
+    rng  : optional RNG (seeded from cfg.rng_seed if omitted)
+
+    Returns
+    -------
+    audio — raw glottal source waveform
+    """
+    import os
+    import wave
+    from synth.klatt import _glottal_source
+    n_samples = int(round(cfg.sr * cfg.duration_s))
+    audio = _glottal_source(n_samples, cfg.sr, cfg.f0_hz, cfg.jitter_frac if cfg.jitter_frac is not None else 0, cfg.shimmer_frac if cfg.shimmer_frac is not None else 0, np.random.default_rng())
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    pcm = (audio * 32767).clip(-32768, 32767).astype(np.int16)
+    with wave.open(path, "w") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(cfg.sr)
+        wf.writeframes(pcm.tobytes())
+    return audio
 
 
 def generate_dataset(

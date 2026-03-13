@@ -184,8 +184,12 @@ class KLTract:
             pb[n]     = p_b[n + 1] + s     # KL-1b
 
         # 3. Lip boundary (§3.7, LIP-1)
+        # Reflection uses OLD p_f[N-1] (simultaneous update — wave that was
+        # already at the lip reflects back, keeping the system matrix causal).
+        # Radiation (LIP-3/4) uses the newly-propagated pf[N-1] so the output
+        # delay matches the one-sample-per-section propagation (spec §3.1).
         r_lip = self._cfg.r_lip
-        pb[N - 1] = -r_lip * pf[N - 1]
+        pb[N - 1] = -r_lip * p_f[N - 1]
 
         # 4. Lip volume velocity (§3.7, LIP-3) and radiation (LIP-4)
         u_lip = (self._areas[N - 1] * (1.0 + r_lip) * pf[N - 1]) / self._rho_c
@@ -366,3 +370,34 @@ def generate_vowel_kl(
     )
 
     return output, meta
+
+
+def save_vowel_wav_kl(
+    path: str,
+    cfg: "SynthConfig",
+    rng: Optional[np.random.Generator] = None,
+) -> tuple[np.ndarray, "VowelMeta"]:
+    """
+    Generate a synthetic vowel via the Kelly-Lochbaum backend and save it as a WAV file.
+
+    Parameters
+    ----------
+    path : destination file path (e.g. "out/vowel_kl.wav")
+    cfg  : SynthConfig (backend will be forced to "kelly_lochbaum")
+    rng  : optional RNG (seeded from cfg.rng_seed if omitted)
+
+    Returns
+    -------
+    audio, meta — same as generate_vowel_kl
+    """
+    import os
+    import wave
+    audio, meta = generate_vowel_kl(cfg, rng=rng)
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    pcm = (audio * 32767).clip(-32768, 32767).astype(np.int16)
+    with wave.open(path, "w") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(cfg.sr)
+        wf.writeframes(pcm.tobytes())
+    return audio, meta

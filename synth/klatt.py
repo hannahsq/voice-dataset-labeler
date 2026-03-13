@@ -95,42 +95,39 @@ def _glottal_source(
     rng:          np.random.Generator,
 ) -> np.ndarray:
     """
-    Generate a band-limited impulse train approximating a glottal pulse train.
+    Generate a band-limited glottal pulse train.
 
-    Each period is a raised-cosine pulse (smoother than a Dirac, avoids
-    aliasing at high F0) with per-period jitter (timing) and shimmer
-    (amplitude).
+    Each period contains a raised-cosine pulse whose phase is evaluated at
+    exact fractional sample positions relative to the true (float) closure
+    time.  This avoids the integer-rounding aliasing that would otherwise
+    create systematic subharmonics whenever sr/f0 is non-integer.
+
+    Pulse width is 1/3 of the nominal period (minimum 3 samples).  The
+    closure instant is at the *end* of the pulse (t_close = t), so the
+    raised cosine runs from t - pulse_width to t.
+
+    Per-period jitter (timing) and shimmer (amplitude) are applied as before.
     """
-    x        = np.zeros(n_samples, dtype=np.float64)
-    period   = sr / f0_hz
-    t        = 0.0
-    amp      = 1.0
+    x      = np.zeros(n_samples, dtype=np.float64)
+    period = sr / f0_hz
+    t      = 0.0           # float closure time of current pulse
+    amp    = 1.0
 
-    # Width of raised-cosine pulse: 1/3 of period, minimum 3 samples
+    # Pulse width fixed from nominal period — does not change between periods
     pulse_width = max(3, int(round(period / 3.0)))
 
-    half = pulse_width // 2
-    pulse_template = 0.5 * (1.0 - np.cos(
-        2.0 * np.pi * np.arange(pulse_width) / (pulse_width - 1)
-    ))
-
     while t < n_samples:
-        pos = int(round(t))
-        if pos >= n_samples:
-            break
+        # Integer sample range that overlaps [t - pulse_width, t)
+        i_start = max(0,         int(np.ceil( t - pulse_width)))
+        i_end   = min(n_samples, int(np.floor(t)) + 1)
 
-        # Write pulse centred at pos, clipped to array bounds
-        start = pos - half
-        end   = start + pulse_width
-        a0    = max(0, -start)
-        a1    = pulse_width - max(0, end - n_samples)
-        s0    = max(0, start)
-        s1    = s0 + (a1 - a0)
-        x[s0:s1] += amp * pulse_template[a0:a1]
+        for n in range(i_start, i_end):
+            # Exact fractional phase in [0, 1]: 0 = pulse onset, 1 = closure
+            phase    = (n - (t - pulse_width)) / pulse_width
+            x[n]    += amp * 0.5 * (1.0 - np.cos(2.0 * np.pi * phase))
 
         # Advance by one period with jitter
-        jitter = rng.normal(0.0, jitter_frac * period)
-        t     += period + jitter
+        t  += period + rng.normal(0.0, jitter_frac * period)
 
         # Shimmer
         amp *= 1.0 + rng.normal(0.0, shimmer_frac)
