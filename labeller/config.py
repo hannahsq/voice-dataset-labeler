@@ -6,6 +6,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import numpy as np
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -38,6 +40,35 @@ VALID_DIRECTION: frozenset = frozenset({"exhale", "inhale"})
 FORMANT_MATCH_TOLERANCE = 0.45   # +/- fraction of delta-F for pole assignment
 
 N_FORMANTS = 7
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+def _window_params(n_samples: int, sr: int, win_ms: float, hop_ms: float,
+                   min_f0_hz: float = 50.0) -> tuple[int, int, float]:
+    """Compute window/hop in samples and effective window duration (ms).
+
+    Returns (win_samples, hop_samples, effective_win_ms).
+    """
+    effective_win_ms = max(win_ms, 3000.0 / min_f0_hz)
+    win_s = effective_win_ms / 1000.0
+    win_samples = min(int(round(sr * win_s)), n_samples)
+    hop_samples = max(1, int(round(sr * hop_ms / 1000.0)))
+    return win_samples, hop_samples, effective_win_ms
+
+
+def _window_centres(n_samples: int, sr: int, win_ms: float, hop_ms: float,
+                    min_f0_hz: float = 50.0) -> np.ndarray:
+    """Return (W,) float32 array of window centre times in seconds."""
+    win_samples, hop_samples, _ = _window_params(n_samples, sr, win_ms, hop_ms, min_f0_hz)
+    centres = []
+    start = 0
+    while start + win_samples <= n_samples:
+        centres.append((start + win_samples / 2.0) / sr)
+        start += hop_samples
+    return np.array(centres, dtype=np.float32)
 
 
 # ---------------------------------------------------------------------------

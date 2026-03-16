@@ -7,6 +7,9 @@ from __future__ import annotations
 import re
 import warnings
 from dataclasses import dataclass
+from typing import Optional, TypedDict
+
+import numpy as np
 
 from .config import (
     VALID_MODALITY,
@@ -143,3 +146,45 @@ class SpeakerMeta:
             raise ValueError(f"vtl_class={self.vtl_class!r} not in {VALID_VTL_CLASS}")
 
         object.__setattr__(self, "tags", frozenset(self.tags))
+
+
+class LabelledSample(TypedDict, total=False):
+    """Canonical schema for a labelled audio sample (per-window arrays).
+
+    Produced by ``_extract_sample`` (real recordings) and
+    ``synth_to_labelled`` (synthetic vowels).  Downstream code uses plain
+    dicts; this TypedDict exists for documentation and IDE support.
+    """
+    # Metadata
+    speaker:          str
+    speaker_meta:     Optional[SpeakerMeta]
+    group:            str
+    label:            str
+    source:           str
+    modality:         str
+    dialect:          str
+
+    # Audio / config
+    audio:            np.ndarray        # (T,) float32
+    sr:               int
+    window_length_ms: float
+    hop_ms:           float
+
+    # Per-window arrays — all shape (W,)
+    t_centre_s:       np.ndarray
+    loudness_dbfs:    np.ndarray
+    spectral_slope:   np.ndarray
+    f0_hz:            np.ndarray
+    periodicity:      np.ndarray
+    f0_praat_hz:      np.ndarray
+    f0_pyin_hz:       np.ndarray
+
+    # Per-window formants — shape (W, N_FORMANTS)
+    formant_hz:       np.ndarray
+    formant_bw_hz:    np.ndarray
+
+    # Per-window VTL — shape (W,)
+    vtl_sample_mm:    np.ndarray
+
+    # Ground truth (synth only; None for real recordings)
+    ground_truth:     Optional[dict]

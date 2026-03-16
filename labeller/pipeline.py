@@ -12,7 +12,7 @@ from typing import Optional
 import numpy as np
 import parselmouth
 
-from .config import LabellerConfig, N_FORMANTS, SPEED_OF_SOUND_MM_S
+from .config import LabellerConfig, N_FORMANTS, SPEED_OF_SOUND_MM_S, _window_params
 from .types import SpeakerMeta, Modality
 from .acoustic import (
     _loudness_dbfs,
@@ -26,7 +26,33 @@ from .formants import (
     _assign_formant_indices,
     VTLSmoother,
 )
+from .config import VTL_PRIOR_MM
 from extractors import FormantExtractor, PraatFormantExtractor
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers: formant ceiling and pole count from a VTL estimate
+# ---------------------------------------------------------------------------
+
+def _formant_ceiling_hz(vtl_mm: float) -> float:
+    """
+    Praat max-formant ceiling for a speaker with the given VTL.
+    (N_FORMANTS + 0.5) * delta_F gives half a spacing of headroom above
+    the top expected formant, suppressing spurious high-frequency poles.
+    Clamped to [4500, 8000] Hz.
+    """
+    delta_f = SPEED_OF_SOUND_MM_S / (2.0 * vtl_mm)
+    return float(np.clip((N_FORMANTS + 0.5) * delta_f, 4500.0, 8000.0))
+
+
+def _n_praat_formants(vtl_mm: float, nyquist_hz: float, cfg_max: int) -> int:
+    """
+    Number of Praat poles to request: floor(nyquist / delta_F), clipped to
+    [1, cfg_max].  Prevents Praat from fitting spurious poles in a spectral
+    region where no real formants can exist.
+    """
+    delta_f = SPEED_OF_SOUND_MM_S / (2.0 * vtl_mm)
+    return max(1, min(cfg_max, int(np.floor(nyquist_hz / delta_f))))
 
 
 # ---------------------------------------------------------------------------
@@ -58,10 +84,9 @@ def _extract_sample(
     _mod     = sample.get("modality", "spoken")
     modality = _mod.modality if isinstance(_mod, Modality) else str(_mod)
 
-    win_ms      = max(cfg.win_ms, 3000.0 / cfg.min_f0_hz)
-    win_s       = win_ms / 1000.0
-    win_samples = min(int(round(sr * win_s)), len(audio))
-    hop_samples = max(1, int(round(sr * cfg.hop_ms / 1000.0)))
+    win_samples, hop_samples, win_ms = _window_params(
+        len(audio), sr, cfg.win_ms, cfg.hop_ms, cfg.min_f0_hz)
+    win_s = win_ms / 1000.0
 
     # Derive a speaker-adapted formant ceiling from the smoothed speaker VTL.
     # Formula: N_FORMANTS * delta_F  where  delta_F = c / (2L)
@@ -70,12 +95,7 @@ def _extract_sample(
     # (e.g. during the seed pass when called from _worker_seed_vtl).
     speaker_vtl = vtl_smoother.smoothed_speaker_vtl(group, speaker)
     if np.isfinite(speaker_vtl) and speaker_vtl > 0:
-        # (N_FORMANTS + 0.5) * delta_F: half a spacing above the top formant
-        # gives headroom without inviting spurious extra poles.
-        dynamic_ceiling = float(np.clip(
-            (N_FORMANTS + 0.5) * SPEED_OF_SOUND_MM_S / (2.0 * speaker_vtl),
-            4500.0, 8000.0,
-        ))
+        dynamic_ceiling = _formant_ceiling_hz(speaker_vtl)
     else:
         dynamic_ceiling = cfg.max_formant_hz
 
@@ -107,11 +127,9 @@ def _extract_sample(
         # windows; falls back to cfg.n_praat_formants during the seed pass.
         nyquist_hz = sr / 2.0
         if np.isfinite(speaker_vtl) and speaker_vtl > 0:
-            delta_f  = SPEED_OF_SOUND_MM_S / (2.0 * speaker_vtl)
-            n_praat  = max(1, min(cfg.n_praat_formants,
-                                  int(np.floor(nyquist_hz / delta_f))))
+            n_praat = _n_praat_formants(speaker_vtl, nyquist_hz, cfg.n_praat_formants)
         else:
-            n_praat  = cfg.n_praat_formants
+            n_praat = cfg.n_praat_formants
         raw_freqs, raw_bws, slope = extractor(
             frame, sr, win_s, max_formant_hz=dynamic_ceiling, n_formants=n_praat)
         vtl_raw      = _vtl_from_formants(raw_freqs)
@@ -206,9 +224,17 @@ def _worker_seed_vtl(
         positions = list(positions)
 
     if not positions:
-        n      = len(audio)
-        raw_f, _, _ = extractor(audio[n//4 : 3*n//4], sr, win_s)
+        prior_vtl = VTL_PRIOR_MM.get(group, VTL_PRIOR_MM["unknown"])
+        ceiling   = _formant_ceiling_hz(prior_vtl)
+        n_seed    = _n_praat_formants(prior_vtl, sr / 2.0, cfg.n_praat_formants)
+        n         = len(audio)
+        raw_f, _, _ = extractor(audio[n//4 : 3*n//4], sr, win_s,
+                                max_formant_hz=ceiling, n_formants=n_seed)
         return group, speaker, _vtl_from_formants(raw_f)
+
+    prior_vtl = VTL_PRIOR_MM.get(group, VTL_PRIOR_MM["unknown"])
+    ceiling   = _formant_ceiling_hz(prior_vtl)
+    n_seed    = _n_praat_formants(prior_vtl, sr / 2.0, cfg.n_praat_formants)
 
     win_samps = int(round(win_s * sr))
     vtls = []
@@ -217,7 +243,7 @@ def _worker_seed_vtl(
         frame = audio[s0 : min(len(audio), s0 + win_samps)]
         if len(frame) < win_samps // 2:
             continue
-        raw_f, _, _ = extractor(frame, sr, win_s)
+        raw_f, _, _ = extractor(frame, sr, win_s, max_formant_hz=ceiling, n_formants=n_seed)
         v = _vtl_from_formants(raw_f)
         if np.isfinite(v):
             vtls.append(v)
@@ -383,7 +409,7 @@ def label_dataset(
         group     = (meta.vtl_class if isinstance(meta, SpeakerMeta)
                      else s.get("group", "unknown"))
         final_vtl = smoother_second.smoothed_speaker_vtl(group, speaker)
-        frozen    = VTLSmoother(prior_strength=1e9, sample_alpha=cfg.vtl_sample_alpha)
+        frozen    = VTLSmoother(prior_strength=0.0, sample_alpha=cfg.vtl_sample_alpha)
         frozen._speaker_vtls[speaker] = [final_vtl]
         frozen._group_vtls[group]     = [final_vtl]
         if meta and isinstance(meta, SpeakerMeta) and meta.vtl_prior_mm is not None:
@@ -533,7 +559,7 @@ def label_incremental(
         group     = (meta.vtl_class if isinstance(meta, SpeakerMeta)
                      else s.get("group", "unknown"))
         final_vtl = smoother.smoothed_speaker_vtl(group, speaker)
-        frozen    = VTLSmoother(prior_strength=1e9, sample_alpha=cfg.vtl_sample_alpha)
+        frozen    = VTLSmoother(prior_strength=0.0, sample_alpha=cfg.vtl_sample_alpha)
         frozen._speaker_vtls[speaker] = [final_vtl]
         frozen._group_vtls[group]     = [final_vtl]
         if meta and isinstance(meta, SpeakerMeta) and meta.vtl_prior_mm is not None:

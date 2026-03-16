@@ -8,6 +8,7 @@ Imports and executes all tests from the split test modules:
   test_labeller_formants.py  — R01-R03  _vtl_from_formants, _assign_formant_indices
   test_labeller_smoother.py  — R04-R07  VTLSmoother
   test_synth_vowels.py       — R09-R10  synth-based integration
+  test_synth_compat.py       — R11     synth-to-labelled conversion
 
 Run individual modules to test a specific area, or run this file to
 execute the full suite and print a combined summary.
@@ -33,6 +34,7 @@ from test_synth_vowels import (
     test_r09_synth_vtl_from_assigned,
     test_r10_synth_group_estimate,
 )
+from test_synth_compat import test_r11_synth_to_labelled
 
 
 if __name__ == "__main__":
@@ -46,6 +48,7 @@ if __name__ == "__main__":
     test_r08_alpha_clamp()
     test_r09_synth_vtl_from_assigned()
     test_r10_synth_group_estimate()
+    test_r11_synth_to_labelled()
 
     n_fail = _print_summary()
     raise SystemExit(0 if n_fail == 0 else 1)

@@ -333,7 +333,7 @@ def load_personal_dataset(
                         if peak > 1e-6:
                             audio = audio / peak
 
-                        formants_raw = estimate_formants(audio, sr=sr)
+                        formants_raw = estimate_formants(audio, sr=actual_sr)
 
                         dataset.append({
                             "audio":        audio,

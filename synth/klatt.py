@@ -51,19 +51,23 @@ def _resonator_coeffs(
     """
     Compute IIR coefficients for a 2nd-order resonator (all-pole bandpass).
 
-    Transfer function:  H(z) = 1 / (1 - 2R*cos(θ)*z⁻¹ + R²*z⁻²)
+    Transfer function:  H(z) = b0 / (1 - 2R*cos(θ)*z⁻¹ + R²*z⁻²)
     where θ = 2π*f/sr,  R = exp(-π*bw/sr).
 
     Returns (b0, a1, a2) for  y[n] = b0*x[n] + a1*y[n-1] + a2*y[n-2]
-    with b0 chosen so DC gain = 1 (normalised).
+    with b0 = 1 - R² (Klatt 1980 normalisation), which gives unit peak gain
+    at the resonant frequency and is stable across all sample rates.
+
+    Note: DC gain normalisation (b0 = 1 - a1 - a2) must NOT be used here
+    because it scales b0 as (f/sr)², causing near-zero input coupling and
+    effectively muting the resonator at sample rates much higher than the
+    formant frequency.
     """
     theta = 2.0 * np.pi * f_hz / sr
     R     = np.exp(-np.pi * bw_hz / sr)
     a1    =  2.0 * R * np.cos(theta)
     a2    = -R * R
-    # DC gain = 1 / (1 - a1 - a2); normalise so resonator has unit DC gain
-    dc    = 1.0 - a1 - a2
-    b0    = dc if abs(dc) > 1e-12 else 1.0
+    b0    =  1.0 - R * R          # ≈ unit peak gain at resonance for all sr
     return b0, a1, a2
 
 
@@ -95,26 +99,35 @@ def _glottal_source(
     rng:          np.random.Generator,
 ) -> np.ndarray:
     """
-    Generate a band-limited glottal pulse train.
+    Generate a glottal pulse train with an asymmetric -x·exp(-x²) shape.
 
-    Each period contains a raised-cosine pulse whose phase is evaluated at
-    exact fractional sample positions relative to the true (float) closure
-    time.  This avoids the integer-rounding aliasing that would otherwise
-    create systematic subharmonics whenever sr/f0 is non-integer.
+    Each period contains a pulse shaped as  f(x) = -x · exp(-x²)  for
+    x ∈ [-3, 0], evaluated at exact fractional sample positions relative to
+    the true (float) closure time.  x = 0 is the instant of glottal closure
+    (end of pulse); x = -3 is the onset.  The shape has a smooth onset,
+    peaks near x ≈ -0.707, then falls sharply to zero at closure — closer
+    to observed glottal flow derivatives than a symmetric raised-cosine.
 
-    Pulse width is 1/3 of the nominal period (minimum 3 samples).  The
-    closure instant is at the *end* of the pulse (t_close = t), so the
-    raised cosine runs from t - pulse_width to t.
+    Evaluating at exact fractional positions (rather than snapping the pulse
+    to integer sample offsets) avoids the systematic subharmonics that arise
+    when sr/f0 is non-integer.
 
+    Pulse width is 1/3 of the nominal period (minimum 3 samples).
     Per-period jitter (timing) and shimmer (amplitude) are applied as before.
     """
+    import math as _math
+
+    # Normalisation constant: peak of -x·exp(-x²) on [-3,0] is at x=-1/√2
+    _INV_SQRT2  = 1.0 / _math.sqrt(2.0)
+    _PULSE_NORM = _INV_SQRT2 * _math.exp(-0.5)   # ≈ 0.4289
+
     x      = np.zeros(n_samples, dtype=np.float64)
     period = sr / f0_hz
     t      = 0.0           # float closure time of current pulse
     amp    = 1.0
 
     # Pulse width fixed from nominal period — does not change between periods
-    pulse_width = max(3, int(round(period / 3.0)))
+    pulse_width = max(3, int(round(period / 5.0)))
 
     while t < n_samples:
         # Integer sample range that overlaps [t - pulse_width, t)
@@ -122,9 +135,9 @@ def _glottal_source(
         i_end   = min(n_samples, int(np.floor(t)) + 1)
 
         for n in range(i_start, i_end):
-            # Exact fractional phase in [0, 1]: 0 = pulse onset, 1 = closure
-            phase    = (n - (t - pulse_width)) / pulse_width
-            x[n]    += amp * 0.5 * (1.0 - np.cos(2.0 * np.pi * phase))
+            # Map sample to x ∈ [-3, 0]: x=0 at closure (t), x=-3 at onset
+            xv       = -3.0 * (t - n) / pulse_width
+            x[n]    += amp * (-xv * _math.exp(-xv * xv)) / _PULSE_NORM
 
         # Advance by one period with jitter
         t  += period + rng.normal(0.0, jitter_frac * period)
