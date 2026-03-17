@@ -302,12 +302,28 @@ def _make_worker_args(
 # Three-pass dataset labeller
 # ---------------------------------------------------------------------------
 
+def _apply_group_priors(smoother: VTLSmoother, group_priors: Optional[dict] = None) -> None:
+    """Register group-level VTL overrides if provided.
+
+    Values may be plain floats (vtl_mm) or ``(vtl_mm, strength)`` tuples
+    to also override the per-group prior strength (n0).
+    """
+    if group_priors:
+        for group, val in group_priors.items():
+            if isinstance(val, (list, tuple)):
+                vtl_mm, strength = val
+                smoother.register_group_override(group, vtl_mm, strength=strength)
+            else:
+                smoother.register_group_override(group, val)
+
+
 def label_dataset(
     samples: list[dict],
     cfg: Optional[LabellerConfig] = None,
     extractor: Optional[FormantExtractor] = None,
     sr: int = 16000,
     verbose: bool = True,
+    group_priors: Optional[dict[str, float]] = None,
 ) -> list[dict]:
     """
     Run the full three-pass labelling pipeline on a dataset.
@@ -357,6 +373,7 @@ def label_dataset(
             seed_results = list(pool.map(_worker_seed_vtl, seed_args))
 
     smoother_raw = VTLSmoother(cfg.vtl_prior_strength, cfg.vtl_sample_alpha)
+    _apply_group_priors(smoother_raw, group_priors)
     for group, speaker, vtl in seed_results:
         smoother_raw.update(group, speaker, vtl)
 
@@ -372,6 +389,7 @@ def label_dataset(
     )
 
     smoother_first = VTLSmoother(cfg.vtl_prior_strength, cfg.vtl_sample_alpha)
+    _apply_group_priors(smoother_first, group_priors)
     for s_out in pass0:
         vtls = s_out["vtl_sample_mm"]
         vtls = vtls[np.isfinite(vtls)]
@@ -390,6 +408,7 @@ def label_dataset(
     )
 
     smoother_second = VTLSmoother(cfg.vtl_prior_strength, cfg.vtl_sample_alpha)
+    _apply_group_priors(smoother_second, group_priors)
     for s_out in pass1:
         vtls = s_out["vtl_sample_mm"]
         vtls = vtls[np.isfinite(vtls)]
@@ -458,6 +477,7 @@ def label_incremental(
     sr: int = 16000,
     refine: bool = False,
     verbose: bool = True,
+    group_priors: Optional[dict[str, float]] = None,
 ) -> list[dict]:
     """
     Label new samples using the pooled VTL statistics from an already-labelled
@@ -510,6 +530,7 @@ def label_incremental(
 
     # Build smoother from existing labelled data
     smoother = _smoother_from_labelled(existing, cfg)
+    _apply_group_priors(smoother, group_priors)
 
     if verbose:
         groups = {}
@@ -592,7 +613,8 @@ def label_incremental(
         return {k: v for k, v in s.items() if k not in _output_keys}
 
     combined_raw = [_strip(s) for s in existing] + list(new_samples)
-    return label_dataset(combined_raw, cfg=cfg, extractor=extractor, sr=sr, verbose=verbose)
+    return label_dataset(combined_raw, cfg=cfg, extractor=extractor, sr=sr,
+                         verbose=verbose, group_priors=group_priors)
 
 
 # ---------------------------------------------------------------------------

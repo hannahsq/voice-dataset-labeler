@@ -141,6 +141,18 @@ class VTLSmoother:
         self._group_vtls:   dict[str, list[float]] = {}
         self._speaker_vtls: dict[str, list[float]] = {}
         self._speaker_override_mm: dict[str, float] = {}  # vtl_prior_mm overrides
+        self._group_prior_override: dict[str, float] = {}  # replaces literature VTL_PRIOR_MM
+        self._group_strength_override: dict[str, float] = {}  # per-group n0
+
+    def register_group_override(self, group: str, vtl_mm: float,
+                                strength: float | None = None) -> None:
+        """Replace the literature prior for a group with an empirical estimate.
+
+        If *strength* is given it overrides ``self.n0`` for this group only.
+        """
+        self._group_prior_override[group] = vtl_mm
+        if strength is not None:
+            self._group_strength_override[group] = strength
 
     def register_speaker_override(self, speaker: str, vtl_prior_mm: float) -> None:
         """Register an explicit mm VTL for a speaker, bypassing group smoothing."""
@@ -155,14 +167,20 @@ class VTLSmoother:
         self._speaker_vtls.setdefault(speaker, []).append(vtl_mm)
 
     def _prior(self, group: str) -> float:
+        if group in self._group_prior_override:
+            return self._group_prior_override[group]
         return VTL_PRIOR_MM.get(group, VTL_PRIOR_MM["unknown"])
+
+    def _n0(self, group: str) -> float:
+        return self._group_strength_override.get(group, self.n0)
 
     def smoothed_group_vtl(self, group: str) -> float:
         vals  = self._group_vtls.get(group, [])
         n     = len(vals)
         if n == 0:
             return self._prior(group)
-        alpha = n / (n + self.n0)
+        n0    = self._n0(group)
+        alpha = n / (n + n0)
         return (1.0 - alpha) * self._prior(group) + alpha * float(np.mean(vals))
 
     def smoothed_speaker_vtl(self, group: str, speaker: str) -> float:
