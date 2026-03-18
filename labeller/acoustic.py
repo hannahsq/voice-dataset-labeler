@@ -8,7 +8,6 @@ import warnings
 
 import numpy as np
 import parselmouth
-import librosa
 
 from .config import LabellerConfig
 
@@ -41,30 +40,26 @@ def _praat_f0(snd: parselmouth.Sound, cfg: LabellerConfig) -> float:
         return np.nan
 
 
-def _pyin_f0(frame: np.ndarray, sr: int, cfg: LabellerConfig) -> float:
+def _praat_f0_all(audio: np.ndarray, sr: int, cfg: LabellerConfig,
+                  t_centres: np.ndarray) -> np.ndarray:
+    """Run Praat pitch once on the whole sample, return F0 at each frame centre."""
+    out = np.full(len(t_centres), np.nan, dtype=np.float32)
     try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            f0, voiced_flag, _ = librosa.pyin(frame.astype(np.float32),
-                                               fmin=cfg.min_f0_hz,
-                                               fmax=cfg.max_f0_hz,
-                                               sr=sr)
-        f0v = f0[voiced_flag.astype(bool)] if voiced_flag is not None else f0
-        f0v = f0v[np.isfinite(f0v)]
-        return float(np.median(f0v)) if len(f0v) else np.nan
+        snd = parselmouth.Sound(audio.astype(np.float64), sampling_frequency=sr)
+        pitch = snd.to_pitch_ac(time_step=None,
+                                pitch_floor=cfg.min_f0_hz,
+                                pitch_ceiling=cfg.max_f0_hz)
+        for i, t in enumerate(t_centres):
+            f0 = pitch.get_value_at_time(float(t))
+            try:
+                f0 = float(f0)
+                if np.isfinite(f0) and f0 > 0:
+                    out[i] = f0
+            except (TypeError, ValueError):
+                pass
     except Exception:
-        return np.nan
-
-
-def _blend_f0(f0_praat: float, f0_pyin: float,
-              modality: str, cfg: LabellerConfig) -> float:
-    if np.isfinite(f0_praat) and np.isfinite(f0_pyin):
-        mean = 0.5 * (f0_praat + f0_pyin)
-        if abs(f0_praat - f0_pyin) / mean <= cfg.f0_agreement_threshold:
-            return mean
-    if modality.startswith("sung"):
-        return f0_pyin if np.isfinite(f0_pyin) else f0_praat
-    return f0_praat if np.isfinite(f0_praat) else f0_pyin
+        pass
+    return out
 
 
 def _estimate_spectral_tilt_alpha(frame: np.ndarray, sr: int) -> tuple[float, float]:

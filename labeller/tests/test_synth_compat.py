@@ -38,7 +38,7 @@ def test_r11_synth_to_labelled():
         "speaker", "speaker_meta", "group", "label", "source", "modality",
         "dialect", "audio", "sr", "window_length_ms", "hop_ms",
         "t_centre_s", "loudness_dbfs", "spectral_slope",
-        "f0_hz", "periodicity", "f0_praat_hz", "f0_pyin_hz",
+        "f0_hz", "periodicity", "f0_praat_hz",
         "formant_hz", "formant_bw_hz", "vtl_sample_mm", "ground_truth",
     }
     missing = expected_keys - set(d.keys())
@@ -49,7 +49,7 @@ def test_r11_synth_to_labelled():
     _check("R11b-W>0", W > 0, f"W={W}")
 
     for key in ("loudness_dbfs", "spectral_slope", "f0_hz", "periodicity",
-                "f0_praat_hz", "f0_pyin_hz", "vtl_sample_mm"):
+                "f0_praat_hz", "vtl_sample_mm"):
         arr = d[key]
         _check(f"R11b-{key}-shape", arr.shape == (W,),
                f"expected ({W},), got {arr.shape}")

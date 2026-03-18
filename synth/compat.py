@@ -111,7 +111,6 @@ def synth_to_labelled(
         "f0_hz":            _broadcast(meta.f0_hz),
         "periodicity":      _broadcast(1.0),
         "f0_praat_hz":      _broadcast(meta.f0_hz),
-        "f0_pyin_hz":       _broadcast(meta.f0_hz),
 
         "formant_hz":       formant_hz_2d,
         "formant_bw_hz":    formant_bw_hz_2d,
