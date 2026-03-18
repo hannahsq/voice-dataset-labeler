@@ -9,38 +9,7 @@ from typing import Optional
 import numpy as np
 import parselmouth
 
-def _estimate_spectral_tilt_alpha(frame: np.ndarray, sr: int) -> tuple[float, float]:
-    """Estimate spectral tilt (dB/oct) and matched pre-emphasis alpha. Returns (slope, alpha); NaN on failure."""
-    try:
-        w     = np.hanning(len(frame))
-        mag   = np.abs(np.fft.rfft(frame * w)) + 1e-12
-        freqs = np.fft.rfftfreq(len(frame), 1.0 / sr)
-        mask  = (freqs >= 300) & (freqs <= 4000)
-        if mask.sum() < 4:
-            return np.nan, np.nan
-        x_log = np.log2(freqs[mask])
-        A     = np.vstack([x_log, np.ones_like(x_log)]).T
-        slope, _ = np.linalg.lstsq(A, 20.0 * np.log10(mag[mask]), rcond=None)[0]
-        target       = -slope
-        w12          = 2.0 * np.pi * np.array([500.0, 4000.0]) / sr
-        desired_diff = target * np.log2(4000.0 / 500.0)
-        best_alpha, best_err = 0.95, 1e9
-        for alpha in np.linspace(0.70, 0.99, 300):
-            H    = np.abs(1.0 - alpha * np.exp(-1j * w12))
-            diff = 20.0 * np.log10(H[1] / H[0])
-            if (err := abs(diff - desired_diff)) < best_err:
-                best_err, best_alpha = err, alpha
-        return float(slope), float(best_alpha)
-    except Exception:
-        return np.nan, np.nan
-
-
-def _apply_preemphasis(x: np.ndarray, alpha: float) -> np.ndarray:
-    """First-order pre-emphasis: y[n] = x[n] - alpha * x[n-1]."""
-    y     = np.empty_like(x)
-    y[0]  = x[0]
-    y[1:] = x[1:] - alpha * x[:-1]
-    return y
+from labeller.acoustic import _estimate_spectral_tilt_alpha, _apply_preemphasis
 
 
 class PraatFormantExtractor:

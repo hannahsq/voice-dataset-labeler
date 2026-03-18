@@ -234,6 +234,17 @@ def _poles_to_formants(
 # Spectral slope helpers (inlined — no external project deps)
 # ---------------------------------------------------------------------------
 
+def _slope_to_alpha(slope: float, sr: int) -> float:
+    """Convert spectral slope (dB/oct) to matched pre-emphasis alpha (vectorised)."""
+    target       = -slope
+    desired_diff = target * np.log2(4000.0 / 500.0)
+    alphas       = np.linspace(0.70, 0.99, 300)
+    w12          = 2.0 * np.pi * np.array([500.0, 4000.0]) / sr
+    H    = np.abs(1.0 - alphas[:, None] * np.exp(-1j * w12[None, :]))
+    diff = 20.0 * np.log10(H[:, 1] / H[:, 0])
+    return float(alphas[np.argmin(np.abs(diff - desired_diff))])
+
+
 def _estimate_slope_and_alpha(frame: np.ndarray, sr: int) -> tuple[float, float]:
     """
     Estimate spectral tilt (dB/octave) and the matched first-order
@@ -248,22 +259,13 @@ def _estimate_slope_and_alpha(frame: np.ndarray, sr: int) -> tuple[float, float]
         if mask.sum() < 4:
             return np.nan, np.nan
 
-        x_log = np.log2(freqs[mask])
-        A     = np.vstack([x_log, np.ones_like(x_log)]).T
-        slope, _ = np.linalg.lstsq(
-            A, 20.0 * np.log10(mag[mask]), rcond=None)[0]
-
-        target       = -slope
-        w12          = 2.0 * np.pi * np.array([500.0, 4000.0]) / sr
-        desired_diff = target * np.log2(4000.0 / 500.0)
-        best_alpha, best_err = 0.95, 1e9
-        for alpha in np.linspace(0.70, 0.99, 300):
-            H    = np.abs(1.0 - alpha * np.exp(-1j * w12))
-            diff = 20.0 * np.log10(H[1] / H[0])
-            if (err := abs(diff - desired_diff)) < best_err:
-                best_err, best_alpha = err, alpha
-
-        return float(slope), float(best_alpha)
+        x     = np.log2(freqs[mask])
+        y     = 20.0 * np.log10(mag[mask])
+        x_mean = x.mean()
+        slope  = float(np.sum((x - x_mean) * (y - y.mean())) /
+                        np.sum((x - x_mean) ** 2))
+        alpha  = _slope_to_alpha(slope, sr)
+        return slope, alpha
     except Exception:
         return np.nan, np.nan
 
@@ -275,16 +277,7 @@ def _alpha_from_slope(slope: float, sr: int) -> float:
     """
     if not np.isfinite(slope):
         return np.nan
-    target       = -slope
-    w12          = 2.0 * np.pi * np.array([500.0, 4000.0]) / sr
-    desired_diff = target * np.log2(4000.0 / 500.0)
-    best_alpha, best_err = 0.95, 1e9
-    for alpha in np.linspace(0.70, 0.99, 300):
-        H    = np.abs(1.0 - alpha * np.exp(-1j * w12))
-        diff = 20.0 * np.log10(H[1] / H[0])
-        if (err := abs(diff - desired_diff)) < best_err:
-            best_err, best_alpha = err, alpha
-    return float(best_alpha)
+    return _slope_to_alpha(slope, sr)
 
 
 # ---------------------------------------------------------------------------
