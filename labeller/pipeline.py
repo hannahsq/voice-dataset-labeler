@@ -99,15 +99,51 @@ def _extract_sample(
     else:
         dynamic_ceiling = cfg.max_formant_hz
 
-    # Pre-allocate accumulators
-    t_centres, loudness_arr, slope_arr = [], [], []
-    f0_arr, period_arr, f0p_arr, f0y_arr = [], [], [], []
+    # Build frame centres
+    t_centres = []
+    start = 0
+    while start + win_samples <= len(audio):
+        t_centres.append((start + win_samples / 2.0) / sr)
+        start += hop_samples
+    t_centres_arr = np.array(t_centres, dtype=np.float32)
+    W = len(t_centres)
+
+    # Nyquist-clipped formant count
+    nyquist_hz = sr / 2.0
+    if np.isfinite(speaker_vtl) and speaker_vtl > 0:
+        n_praat = _n_praat_formants(speaker_vtl, nyquist_hz, cfg.n_praat_formants)
+    else:
+        n_praat = cfg.n_praat_formants
+
+    # --- Formant extraction: whole-sample when extractor supports it ---
+    if hasattr(extractor, "extract_all"):
+        raw_freqs_all, raw_bws_all, slope_arr_raw = extractor.extract_all(
+            audio, sr, t_centres_arr, win_s,
+            max_formant_hz=dynamic_ceiling, n_formants=n_praat,
+        )
+    else:
+        # Per-frame fallback (TVLP or other extractors)
+        raw_freqs_all = np.full((W, N_FORMANTS), np.nan, dtype=np.float32)
+        raw_bws_all   = np.full((W, N_FORMANTS), np.nan, dtype=np.float32)
+        slope_arr_raw = np.full(W, np.nan, dtype=np.float32)
+        start = 0
+        for w in range(W):
+            frame = audio[start : start + win_samples]
+            rf, rb, sl = extractor(
+                frame, sr, win_s, max_formant_hz=dynamic_ceiling, n_formants=n_praat)
+            raw_freqs_all[w, :len(rf)] = rf
+            raw_bws_all[w, :len(rb)]   = rb
+            slope_arr_raw[w]           = sl
+            start += hop_samples
+
+    # --- Per-window: loudness, F0, periodicity, formant assignment ---
+    loudness_arr, f0_arr, period_arr = [], [], []
+    f0p_arr, f0y_arr = [], []
     formant_f_rows, formant_b_rows, vtl_sample_arr = [], [], []
 
     start = 0
-    while start + win_samples <= len(audio):
+    for w in range(W):
         frame      = audio[start : start + win_samples]
-        t_centre_s = (start + win_samples / 2.0) / sr
 
         loudness = _loudness_dbfs(frame)
         voiced   = loudness >= cfg.voicing_threshold_dbfs
@@ -122,24 +158,14 @@ def _extract_sample(
 
         period = _periodicity(frame, sr, f0)
 
-        # Nyquist-clipped formant count: only ask Praat for poles that can
-        # physically exist.  Uses smoothed speaker VTL so it's stable across
-        # windows; falls back to cfg.n_praat_formants during the seed pass.
-        nyquist_hz = sr / 2.0
-        if np.isfinite(speaker_vtl) and speaker_vtl > 0:
-            n_praat = _n_praat_formants(speaker_vtl, nyquist_hz, cfg.n_praat_formants)
-        else:
-            n_praat = cfg.n_praat_formants
-        raw_freqs, raw_bws, slope = extractor(
-            frame, sr, win_s, max_formant_hz=dynamic_ceiling, n_formants=n_praat)
+        raw_freqs = raw_freqs_all[w]
+        raw_bws   = raw_bws_all[w]
         vtl_raw      = _vtl_from_formants(raw_freqs)
         smoothed_vtl = vtl_smoother.smooth_vtl(group, speaker, vtl_raw)
-        freqs_out, bws_out = _assign_formant_indices(raw_freqs, raw_bws, smoothed_vtl, nyquist_hz=sr / 2.0)
+        freqs_out, bws_out = _assign_formant_indices(raw_freqs, raw_bws, smoothed_vtl, nyquist_hz=nyquist_hz)
         vtl_sample   = _vtl_from_formants(freqs_out)
 
-        t_centres.append(t_centre_s)
         loudness_arr.append(loudness)
-        slope_arr.append(slope)
         f0_arr.append(f0)
         period_arr.append(period)
         f0p_arr.append(f0_praat)
@@ -149,6 +175,8 @@ def _extract_sample(
         vtl_sample_arr.append(vtl_sample)
 
         start += hop_samples
+
+    slope_arr = slope_arr_raw
 
     def _f32(lst):
         return np.array(lst, dtype=np.float32)
