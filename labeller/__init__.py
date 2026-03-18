@@ -70,7 +70,6 @@ Output schema  (one dict per source sample)
     f0_hz            : (N,)    float32   NaN where unvoiced
     periodicity      : (N,)    float32
     f0_praat_hz      : (N,)    float32
-    f0_pyin_hz       : (N,)    float32
     formant_hz       : (N, 7)  float32   F1-F7 frequencies
     formant_bw_hz    : (N, 7)  float32   F1-F7 bandwidths
     vtl_sample_mm    : (N,)    float32   unsmoothed per-window VTL
@@ -100,8 +99,6 @@ from .acoustic import (
     _loudness_dbfs,
     _periodicity,
     _praat_f0,
-    _pyin_f0,
-    _blend_f0,
     _estimate_spectral_tilt_alpha,
     _apply_preemphasis,
 )

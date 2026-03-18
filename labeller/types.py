@@ -177,7 +177,6 @@ class LabelledSample(TypedDict, total=False):
     f0_hz:            np.ndarray
     periodicity:      np.ndarray
     f0_praat_hz:      np.ndarray
-    f0_pyin_hz:       np.ndarray
 
     # Per-window formants — shape (W, N_FORMANTS)
     formant_hz:       np.ndarray

@@ -8,7 +8,6 @@ import warnings
 
 import numpy as np
 import parselmouth
-import librosa
 
 from .config import LabellerConfig
 
@@ -41,30 +40,39 @@ def _praat_f0(snd: parselmouth.Sound, cfg: LabellerConfig) -> float:
         return np.nan
 
 
-def _pyin_f0(frame: np.ndarray, sr: int, cfg: LabellerConfig) -> float:
+def _praat_f0_all(audio: np.ndarray, sr: int, cfg: LabellerConfig,
+                  t_centres: np.ndarray) -> np.ndarray:
+    """Run Praat pitch once on the whole sample, return F0 at each frame centre."""
+    out = np.full(len(t_centres), np.nan, dtype=np.float32)
     try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            f0, voiced_flag, _ = librosa.pyin(frame.astype(np.float32),
-                                               fmin=cfg.min_f0_hz,
-                                               fmax=cfg.max_f0_hz,
-                                               sr=sr)
-        f0v = f0[voiced_flag.astype(bool)] if voiced_flag is not None else f0
-        f0v = f0v[np.isfinite(f0v)]
-        return float(np.median(f0v)) if len(f0v) else np.nan
+        snd = parselmouth.Sound(audio.astype(np.float64), sampling_frequency=sr)
+        pitch = snd.to_pitch_ac(time_step=None,
+                                pitch_floor=cfg.min_f0_hz,
+                                pitch_ceiling=cfg.max_f0_hz)
+        for i, t in enumerate(t_centres):
+            f0 = pitch.get_value_at_time(float(t))
+            try:
+                f0 = float(f0)
+                if np.isfinite(f0) and f0 > 0:
+                    out[i] = f0
+            except (TypeError, ValueError):
+                pass
     except Exception:
-        return np.nan
+        pass
+    return out
 
 
-def _blend_f0(f0_praat: float, f0_pyin: float,
-              modality: str, cfg: LabellerConfig) -> float:
-    if np.isfinite(f0_praat) and np.isfinite(f0_pyin):
-        mean = 0.5 * (f0_praat + f0_pyin)
-        if abs(f0_praat - f0_pyin) / mean <= cfg.f0_agreement_threshold:
-            return mean
-    if modality.startswith("sung"):
-        return f0_pyin if np.isfinite(f0_pyin) else f0_praat
-    return f0_praat if np.isfinite(f0_praat) else f0_pyin
+def _slope_to_alpha(slope: float, sr: int) -> float:
+    """Convert spectral slope (dB/oct) to matched pre-emphasis alpha."""
+    target       = -slope
+    desired_diff = target * np.log2(4000.0 / 500.0)
+    alphas       = np.linspace(0.70, 0.99, 300)
+    w12          = 2.0 * np.pi * np.array([500.0, 4000.0]) / sr
+    # Vectorised: compute H(w) for all alphas at once
+    # alphas[:, None] * exp(-j*w12)[None, :] → (300, 2)
+    H    = np.abs(1.0 - alphas[:, None] * np.exp(-1j * w12[None, :]))
+    diff = 20.0 * np.log10(H[:, 1] / H[:, 0])
+    return float(alphas[np.argmin(np.abs(diff - desired_diff))])
 
 
 def _estimate_spectral_tilt_alpha(frame: np.ndarray, sr: int) -> tuple[float, float]:
@@ -81,21 +89,14 @@ def _estimate_spectral_tilt_alpha(frame: np.ndarray, sr: int) -> tuple[float, fl
         if mask.sum() < 4:
             return np.nan, np.nan
 
-        x_log = np.log2(freqs[mask])
-        A     = np.vstack([x_log, np.ones_like(x_log)]).T
-        slope, _ = np.linalg.lstsq(A, 20.0 * np.log10(mag[mask]), rcond=None)[0]
-
-        target       = -slope
-        w12          = 2.0 * np.pi * np.array([500.0, 4000.0]) / sr
-        desired_diff = target * np.log2(4000.0 / 500.0)
-        best_alpha, best_err = 0.95, 1e9
-        for alpha in np.linspace(0.70, 0.99, 300):
-            H    = np.abs(1.0 - alpha * np.exp(-1j * w12))
-            diff = 20.0 * np.log10(H[1] / H[0])
-            if (err := abs(diff - desired_diff)) < best_err:
-                best_err, best_alpha = err, alpha
-
-        return float(slope), float(best_alpha)
+        x     = np.log2(freqs[mask])
+        y     = 20.0 * np.log10(mag[mask])
+        # Closed-form slope: cov(x,y) / var(x)
+        x_mean = x.mean()
+        slope  = float(np.sum((x - x_mean) * (y - y.mean())) /
+                        np.sum((x - x_mean) ** 2))
+        alpha  = _slope_to_alpha(slope, sr)
+        return slope, alpha
     except Exception:
         return np.nan, np.nan
 

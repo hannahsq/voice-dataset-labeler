@@ -18,8 +18,7 @@ from .acoustic import (
     _loudness_dbfs,
     _periodicity,
     _praat_f0,
-    _pyin_f0,
-    _blend_f0,
+    _praat_f0_all,
 )
 from .formants import (
     _vtl_from_formants,
@@ -99,56 +98,85 @@ def _extract_sample(
     else:
         dynamic_ceiling = cfg.max_formant_hz
 
-    # Pre-allocate accumulators
-    t_centres, loudness_arr, slope_arr = [], [], []
-    f0_arr, period_arr, f0p_arr, f0y_arr = [], [], [], []
+    # Build frame centres
+    t_centres = []
+    start = 0
+    while start + win_samples <= len(audio):
+        t_centres.append((start + win_samples / 2.0) / sr)
+        start += hop_samples
+    t_centres_arr = np.array(t_centres, dtype=np.float32)
+    W = len(t_centres)
+
+    # Nyquist-clipped formant count
+    nyquist_hz = sr / 2.0
+    if np.isfinite(speaker_vtl) and speaker_vtl > 0:
+        n_praat = _n_praat_formants(speaker_vtl, nyquist_hz, cfg.n_praat_formants)
+    else:
+        n_praat = cfg.n_praat_formants
+
+    # --- Formant extraction: whole-sample when extractor supports it ---
+    if hasattr(extractor, "extract_all"):
+        raw_freqs_all, raw_bws_all, slope_arr_raw = extractor.extract_all(
+            audio, sr, t_centres_arr, win_s,
+            max_formant_hz=dynamic_ceiling, n_formants=n_praat,
+        )
+    else:
+        # Per-frame fallback (TVLP or other extractors)
+        raw_freqs_all = np.full((W, N_FORMANTS), np.nan, dtype=np.float32)
+        raw_bws_all   = np.full((W, N_FORMANTS), np.nan, dtype=np.float32)
+        slope_arr_raw = np.full(W, np.nan, dtype=np.float32)
+        start = 0
+        for w in range(W):
+            frame = audio[start : start + win_samples]
+            rf, rb, sl = extractor(
+                frame, sr, win_s, max_formant_hz=dynamic_ceiling, n_formants=n_praat)
+            raw_freqs_all[w, :len(rf)] = rf
+            raw_bws_all[w, :len(rb)]   = rb
+            slope_arr_raw[w]           = sl
+            start += hop_samples
+
+    # --- Whole-sample F0 extraction (single Praat call) ---
+    f0_praat_all = _praat_f0_all(audio, sr, cfg, t_centres_arr)
+
+    # --- Per-window: loudness, F0, periodicity, formant assignment ---
+    loudness_arr = np.empty(W, dtype=np.float32)
+    f0_arr       = np.empty(W, dtype=np.float32)
+    period_arr   = np.empty(W, dtype=np.float32)
     formant_f_rows, formant_b_rows, vtl_sample_arr = [], [], []
 
     start = 0
-    while start + win_samples <= len(audio):
-        frame      = audio[start : start + win_samples]
-        t_centre_s = (start + win_samples / 2.0) / sr
-
+    for w in range(W):
+        frame    = audio[start : start + win_samples]
         loudness = _loudness_dbfs(frame)
         voiced   = loudness >= cfg.voicing_threshold_dbfs
 
-        snd = parselmouth.Sound(frame.astype(np.float64), sampling_frequency=sr)
         if voiced:
-            f0_praat = _praat_f0(snd, cfg)
-            f0_pyin  = _pyin_f0(frame, sr, cfg)
-            f0       = _blend_f0(f0_praat, f0_pyin, modality, cfg)
+            f0 = float(f0_praat_all[w])
+            if not np.isfinite(f0):
+                f0 = np.nan
         else:
-            f0_praat = f0_pyin = f0 = np.nan
+            f0 = np.nan
+            f0_praat_all[w] = np.nan
 
         period = _periodicity(frame, sr, f0)
 
-        # Nyquist-clipped formant count: only ask Praat for poles that can
-        # physically exist.  Uses smoothed speaker VTL so it's stable across
-        # windows; falls back to cfg.n_praat_formants during the seed pass.
-        nyquist_hz = sr / 2.0
-        if np.isfinite(speaker_vtl) and speaker_vtl > 0:
-            n_praat = _n_praat_formants(speaker_vtl, nyquist_hz, cfg.n_praat_formants)
-        else:
-            n_praat = cfg.n_praat_formants
-        raw_freqs, raw_bws, slope = extractor(
-            frame, sr, win_s, max_formant_hz=dynamic_ceiling, n_formants=n_praat)
+        raw_freqs = raw_freqs_all[w]
+        raw_bws   = raw_bws_all[w]
         vtl_raw      = _vtl_from_formants(raw_freqs)
         smoothed_vtl = vtl_smoother.smooth_vtl(group, speaker, vtl_raw)
-        freqs_out, bws_out = _assign_formant_indices(raw_freqs, raw_bws, smoothed_vtl, nyquist_hz=sr / 2.0)
+        freqs_out, bws_out = _assign_formant_indices(raw_freqs, raw_bws, smoothed_vtl, nyquist_hz=nyquist_hz)
         vtl_sample   = _vtl_from_formants(freqs_out)
 
-        t_centres.append(t_centre_s)
-        loudness_arr.append(loudness)
-        slope_arr.append(slope)
-        f0_arr.append(f0)
-        period_arr.append(period)
-        f0p_arr.append(f0_praat)
-        f0y_arr.append(f0_pyin)
+        loudness_arr[w] = loudness
+        f0_arr[w]       = f0
+        period_arr[w]   = period
         formant_f_rows.append(freqs_out)
         formant_b_rows.append(bws_out)
         vtl_sample_arr.append(vtl_sample)
 
         start += hop_samples
+
+    slope_arr = slope_arr_raw
 
     def _f32(lst):
         return np.array(lst, dtype=np.float32)
@@ -166,12 +194,11 @@ def _extract_sample(
         "window_length_ms": win_ms,
         "hop_ms":           cfg.hop_ms,
         "t_centre_s":       _f32(t_centres),
-        "loudness_dbfs":    _f32(loudness_arr),
+        "loudness_dbfs":    loudness_arr,
         "spectral_slope":   _f32(slope_arr),
-        "f0_hz":            _f32(f0_arr),
-        "periodicity":      _f32(period_arr),
-        "f0_praat_hz":      _f32(f0p_arr),
-        "f0_pyin_hz":       _f32(f0y_arr),
+        "f0_hz":            f0_arr,
+        "periodicity":      period_arr,
+        "f0_praat_hz":      f0_praat_all,
         "formant_hz":       np.stack(formant_f_rows).astype(np.float32) if formant_f_rows
                             else np.empty((0, N_FORMANTS), dtype=np.float32),
         "formant_bw_hz":    np.stack(formant_b_rows).astype(np.float32) if formant_b_rows
@@ -605,7 +632,7 @@ def label_incremental(
     # clean input dicts (it only needs the raw audio + metadata fields).
     _output_keys = {
         "t_centre_s", "loudness_dbfs", "spectral_slope", "f0_hz", "periodicity",
-        "f0_praat_hz", "f0_pyin_hz", "formant_hz", "formant_bw_hz",
+        "f0_praat_hz", "formant_hz", "formant_bw_hz",
         "vtl_sample_mm", "window_length_ms", "hop_ms",
         "outlier_flags", "outlier_mask",
     }
