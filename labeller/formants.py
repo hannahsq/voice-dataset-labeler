@@ -1,5 +1,5 @@
 """
-Praat formant extraction, VTL math, pole assignment, and the VTLSmoother.
+Praat formant extraction, VTL math, and pole assignment.
 """
 
 from __future__ import annotations
@@ -12,7 +12,6 @@ from .config import (
     SPEED_OF_SOUND_MM_S,
     N_FORMANTS,
     FORMANT_MATCH_TOLERANCE,
-    VTL_PRIOR_MM,
     LabellerConfig,
 )
 from extractors.praat import PraatFormantExtractor
@@ -49,14 +48,26 @@ def _extract_raw_formants(
 # VTL / formant utilities
 # ---------------------------------------------------------------------------
 
-def _vtl_from_formants(freqs: np.ndarray) -> float:
-    """Median VTL estimate from assigned formant frequencies (mm)."""
-    estimates = [
-        (2 * (i + 1) - 1) * SPEED_OF_SOUND_MM_S / (4.0 * f)
-        for i, f in enumerate(freqs)
-        if np.isfinite(f) and f > 0
-    ]
-    return float(np.median(estimates)) if estimates else np.nan
+def _vtl_from_formants(
+    freqs: np.ndarray, *, return_all: bool = False,
+) -> float | np.ndarray:
+    """VTL estimate(s) from assigned formant frequencies (mm).
+
+    When *return_all* is False (default), returns the median as a float.
+    When True, returns a 1-D array of per-formant VTL estimates (NaN where
+    the formant was missing).  The per-formant array is used by the GMM
+    noise separation step.
+    """
+    per_formant = np.full(len(freqs), np.nan, dtype=np.float64)
+    for i, f in enumerate(freqs):
+        if np.isfinite(f) and f > 0:
+            per_formant[i] = (2 * (i + 1) - 1) * SPEED_OF_SOUND_MM_S / (4.0 * f)
+
+    if return_all:
+        return per_formant
+
+    valid = per_formant[np.isfinite(per_formant)]
+    return float(np.median(valid)) if len(valid) else np.nan
 
 
 def _assign_formant_indices(
@@ -117,94 +128,3 @@ def _assign_formant_indices(
 
     return out_f, out_b
 
-
-# ---------------------------------------------------------------------------
-# Hierarchical VTL smoother
-# ---------------------------------------------------------------------------
-
-class VTLSmoother:
-    """
-    Blends group/speaker VTL statistics with the literature prior using
-    uncertainty-weighted alphas:  alpha = n / (n + n0).
-
-    group is a vtl_class string: "small" | "medium" | "large" | "unknown".
-
-    If a SpeakerMeta with vtl_prior_mm set is registered via
-    register_speaker_override(), the group-level blend is skipped for that
-    speaker and the explicit mm value seeds the speaker level directly.
-    Per-sample alpha still applies.
-    """
-
-    def __init__(self, prior_strength: float = 10.0, sample_alpha: float = 0.30):
-        self.n0                    = prior_strength
-        self.sample_alpha          = sample_alpha
-        self._group_vtls:   dict[str, list[float]] = {}
-        self._speaker_vtls: dict[str, list[float]] = {}
-        self._speaker_override_mm: dict[str, float] = {}  # vtl_prior_mm overrides
-        self._group_prior_override: dict[str, float] = {}  # replaces literature VTL_PRIOR_MM
-        self._group_strength_override: dict[str, float] = {}  # per-group n0
-
-    def register_group_override(self, group: str, vtl_mm: float,
-                                strength: float | None = None) -> None:
-        """Replace the literature prior for a group with an empirical estimate.
-
-        If *strength* is given it overrides ``self.n0`` for this group only.
-        """
-        self._group_prior_override[group] = vtl_mm
-        if strength is not None:
-            self._group_strength_override[group] = strength
-
-    def register_speaker_override(self, speaker: str, vtl_prior_mm: float) -> None:
-        """Register an explicit mm VTL for a speaker, bypassing group smoothing."""
-        self._speaker_override_mm[speaker] = vtl_prior_mm
-        # Also seed the speaker list so downstream alpha sees data
-        self._speaker_vtls.setdefault(speaker, []).append(vtl_prior_mm)
-
-    def update(self, group: str, speaker: str, vtl_mm: float) -> None:
-        if not np.isfinite(vtl_mm):
-            return
-        self._group_vtls.setdefault(group, []).append(vtl_mm)
-        self._speaker_vtls.setdefault(speaker, []).append(vtl_mm)
-
-    def _prior(self, group: str) -> float:
-        if group in self._group_prior_override:
-            return self._group_prior_override[group]
-        return VTL_PRIOR_MM.get(group, VTL_PRIOR_MM["unknown"])
-
-    def _n0(self, group: str) -> float:
-        return self._group_strength_override.get(group, self.n0)
-
-    def smoothed_group_vtl(self, group: str) -> float:
-        vals  = self._group_vtls.get(group, [])
-        n     = len(vals)
-        if n == 0:
-            return self._prior(group)
-        n0    = self._n0(group)
-        alpha = n / (n + n0)
-        return (1.0 - alpha) * self._prior(group) + alpha * float(np.mean(vals))
-
-    def smoothed_speaker_vtl(self, group: str, speaker: str) -> float:
-        # If an explicit override is registered, skip group-level blend entirely
-        if speaker in self._speaker_override_mm:
-            override  = self._speaker_override_mm[speaker]
-            spk_vals  = self._speaker_vtls.get(speaker, [])
-            n         = len(spk_vals)
-            if n <= 1:
-                return override
-            alpha = n / (n + self.n0)
-            return (1.0 - alpha) * override + alpha * float(np.mean(spk_vals))
-
-        vals      = self._speaker_vtls.get(speaker, [])
-        n         = len(vals)
-        group_vtl = self.smoothed_group_vtl(group)
-        if n == 0:
-            return group_vtl
-        alpha = n / (n + self.n0)
-        return (1.0 - alpha) * group_vtl + alpha * float(np.mean(vals))
-
-    def smooth_vtl(self, group: str, speaker: str, raw_vtl: float) -> float:
-        """literature -> group -> speaker -> sample blend."""
-        spk_vtl = self.smoothed_speaker_vtl(group, speaker)
-        if not np.isfinite(raw_vtl):
-            return spk_vtl
-        return (1.0 - self.sample_alpha) * spk_vtl + self.sample_alpha * raw_vtl

@@ -115,6 +115,8 @@ def synth_to_labelled(
         "formant_hz":       formant_hz_2d,
         "formant_bw_hz":    formant_bw_hz_2d,
         "vtl_sample_mm":    _broadcast(meta.vtl_mm),
+        "vtl_posterior_mu_mm":    meta.vtl_mm,
+        "vtl_posterior_sigma_mm": 0.0,  # synth has perfect VTL knowledge
 
         "ground_truth":     ground_truth,
     }

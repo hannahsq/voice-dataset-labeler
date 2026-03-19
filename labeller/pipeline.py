@@ -1,5 +1,6 @@
 """
-Core extraction, parallel workers, and the multi-pass labelling pipeline.
+Core extraction, parallel workers, and the convergence-based Bayesian
+labelling pipeline.
 """
 
 from __future__ import annotations
@@ -12,7 +13,7 @@ from typing import Optional
 import numpy as np
 import parselmouth
 
-from .config import LabellerConfig, N_FORMANTS, SPEED_OF_SOUND_MM_S, _window_params
+from .config import LabellerConfig, N_FORMANTS, SPEED_OF_SOUND_MM_S, VTL_PRIOR_MM, _window_params
 from .types import SpeakerMeta, Modality
 from .acoustic import (
     _loudness_dbfs,
@@ -23,9 +24,13 @@ from .acoustic import (
 from .formants import (
     _vtl_from_formants,
     _assign_formant_indices,
-    VTLSmoother,
 )
-from .config import VTL_PRIOR_MM
+from .bayesian_vtl import (
+    BayesianVTLEstimator,
+    NormalPosterior,
+    fit_vtl_mixture,
+    _SampleObs,
+)
 from extractors import FormantExtractor, PraatFormantExtractor
 
 
@@ -61,25 +66,25 @@ def _n_praat_formants(vtl_mm: float, nyquist_hz: float, cfg_max: int) -> int:
 def _extract_sample(
     sample: dict,
     cfg: LabellerConfig,
-    vtl_smoother: VTLSmoother,
+    speaker_vtl_mm: float,
     extractor: FormantExtractor,
 ) -> dict:
     """
     Slice one sample into overlapping windows and extract acoustic features.
 
-    vtl_smoother is read-only (frozen snapshot passed from the calling pass).
+    speaker_vtl_mm is the current Bayesian posterior mean for this speaker's
+    VTL.  It drives the dynamic formant ceiling and pole assignment.
+
     Returns a single transposed dict matching the module output schema.
-    Unvoiced windows are retained with NaN for F0/periodicity so the full
-    timeline is available for downstream windowed std computation.
+    Includes a transient 'vtl_per_formant' field (W, N_FORMANTS) for
+    downstream GMM fitting; callers should strip this before final output.
     """
     audio    = sample["audio"].astype(np.float32)
     sr       = sample.get("sr", 16000)
     speaker  = sample.get("speaker", "unknown")
-    # group is a vtl_class string; speaker_meta.vtl_class is the canonical source
     meta     = sample.get("speaker_meta")
     group    = (meta.vtl_class if isinstance(meta, SpeakerMeta)
                 else sample.get("group", "unknown"))
-    # modality: accept Modality object or plain string
     _mod     = sample.get("modality", "spoken")
     modality = _mod.modality if isinstance(_mod, Modality) else str(_mod)
 
@@ -87,14 +92,9 @@ def _extract_sample(
         len(audio), sr, cfg.win_ms, cfg.hop_ms, cfg.min_f0_hz)
     win_s = win_ms / 1000.0
 
-    # Derive a speaker-adapted formant ceiling from the smoothed speaker VTL.
-    # Formula: N_FORMANTS * delta_F  where  delta_F = c / (2L)
-    # Clamped to [4500, 8000] Hz so it stays physiologically meaningful.
-    # Falls back to cfg.max_formant_hz when the smoother has no VTL data yet
-    # (e.g. during the seed pass when called from _worker_seed_vtl).
-    speaker_vtl = vtl_smoother.smoothed_speaker_vtl(group, speaker)
-    if np.isfinite(speaker_vtl) and speaker_vtl > 0:
-        dynamic_ceiling = _formant_ceiling_hz(speaker_vtl)
+    # Dynamic formant ceiling from Bayesian speaker VTL posterior
+    if np.isfinite(speaker_vtl_mm) and speaker_vtl_mm > 0:
+        dynamic_ceiling = _formant_ceiling_hz(speaker_vtl_mm)
     else:
         dynamic_ceiling = cfg.max_formant_hz
 
@@ -109,8 +109,8 @@ def _extract_sample(
 
     # Nyquist-clipped formant count
     nyquist_hz = sr / 2.0
-    if np.isfinite(speaker_vtl) and speaker_vtl > 0:
-        n_praat = _n_praat_formants(speaker_vtl, nyquist_hz, cfg.n_praat_formants)
+    if np.isfinite(speaker_vtl_mm) and speaker_vtl_mm > 0:
+        n_praat = _n_praat_formants(speaker_vtl_mm, nyquist_hz, cfg.n_praat_formants)
     else:
         n_praat = cfg.n_praat_formants
 
@@ -143,6 +143,7 @@ def _extract_sample(
     f0_arr       = np.empty(W, dtype=np.float32)
     period_arr   = np.empty(W, dtype=np.float32)
     formant_f_rows, formant_b_rows, vtl_sample_arr = [], [], []
+    vtl_per_formant = np.full((W, N_FORMANTS), np.nan, dtype=np.float32)
 
     start = 0
     for w in range(W):
@@ -162,10 +163,16 @@ def _extract_sample(
 
         raw_freqs = raw_freqs_all[w]
         raw_bws   = raw_bws_all[w]
-        vtl_raw      = _vtl_from_formants(raw_freqs)
-        smoothed_vtl = vtl_smoother.smooth_vtl(group, speaker, vtl_raw)
-        freqs_out, bws_out = _assign_formant_indices(raw_freqs, raw_bws, smoothed_vtl, nyquist_hz=nyquist_hz)
-        vtl_sample   = _vtl_from_formants(freqs_out)
+
+        # Use speaker posterior mean for formant assignment (no per-window smoothing)
+        freqs_out, bws_out = _assign_formant_indices(
+            raw_freqs, raw_bws, speaker_vtl_mm, nyquist_hz=nyquist_hz)
+        vtl_sample = _vtl_from_formants(freqs_out)
+
+        # Per-formant VTL for GMM (from raw poles, not assigned)
+        vtl_pf = _vtl_from_formants(raw_freqs, return_all=True)
+        n_pf = min(len(vtl_pf), N_FORMANTS)
+        vtl_per_formant[w, :n_pf] = vtl_pf[:n_pf].astype(np.float32)
 
         loudness_arr[w] = loudness
         f0_arr[w]       = f0
@@ -204,6 +211,7 @@ def _extract_sample(
         "formant_bw_hz":    np.stack(formant_b_rows).astype(np.float32) if formant_b_rows
                             else np.empty((0, N_FORMANTS), dtype=np.float32),
         "vtl_sample_mm":    _f32(vtl_sample_arr),
+        "vtl_per_formant":  vtl_per_formant,  # transient — stripped before final output
     }
 
 
@@ -211,10 +219,10 @@ def _extract_sample(
 # Module-level picklable workers
 # ---------------------------------------------------------------------------
 
-def _worker_extract(args: tuple[dict, LabellerConfig, VTLSmoother, FormantExtractor]) -> dict:
+def _worker_extract(args: tuple[dict, LabellerConfig, float, FormantExtractor]) -> dict:
     """Extract one sample (parallel worker). Returns transposed sample dict."""
-    sample, cfg, smoother, extractor = args
-    return _extract_sample(sample, cfg, smoother, extractor)
+    sample, cfg, speaker_vtl_mm, extractor = args
+    return _extract_sample(sample, cfg, speaker_vtl_mm, extractor)
 
 
 def _worker_seed_vtl(
@@ -222,7 +230,8 @@ def _worker_seed_vtl(
 ) -> tuple[str, str, float]:
     """
     Compute a robust median VTL estimate from up to 20 intensity-gated
-    positions across a sample.  Used to seed the smoother before pass 0.
+    positions across a sample.  Used to seed the estimator before the
+    convergence loop.
     Returns (group, speaker, median_vtl_mm).
     """
     s, cfg, extractor = args
@@ -319,30 +328,89 @@ def _parallel_map(
 def _make_worker_args(
     samples: list[dict],
     cfg: LabellerConfig,
-    smoother: VTLSmoother,
+    estimator: BayesianVTLEstimator,
     extractor: FormantExtractor,
 ) -> list[tuple]:
-    return [(s, cfg, smoother, extractor) for s in samples]
+    """Build worker args using speaker VTL from the Bayesian estimator."""
+    args = []
+    for s in samples:
+        speaker = s.get("speaker", "unknown")
+        vtl_mm = estimator.speaker_vtl(speaker)
+        args.append((s, cfg, vtl_mm, extractor))
+    return args
 
 
 # ---------------------------------------------------------------------------
-# Three-pass dataset labeller
+# GMM fitting: extract per-sample observations from extraction results
 # ---------------------------------------------------------------------------
 
-def _apply_group_priors(smoother: VTLSmoother, group_priors: Optional[dict] = None) -> None:
+def _fit_gmms(
+    results: list[dict],
+    cfg: LabellerConfig,
+) -> dict[str, dict[str, list[_SampleObs]]]:
+    """Fit GMMs to vtl_per_formant arrays and structure observations
+    for the BayesianVTLEstimator.
+
+    Returns dict[group, dict[speaker, list[_SampleObs]]].
+    """
+    observations: dict[str, dict[str, list[_SampleObs]]] = {}
+
+    for s_out in results:
+        group   = s_out["group"]
+        speaker = s_out["speaker"]
+        vtl_pf  = s_out.get("vtl_per_formant")
+
+        if vtl_pf is None:
+            continue
+
+        # Pool all per-frame per-formant VTL observations for this sample
+        vtl_flat = vtl_pf.ravel()
+        vtl_flat = vtl_flat[np.isfinite(vtl_flat)]
+
+        if len(vtl_flat) < 2:
+            continue
+
+        narrow_mean, narrow_var, _ = fit_vtl_mixture(
+            vtl_flat, min_obs=cfg.vtl_gmm_min_obs)
+
+        if not np.isfinite(narrow_mean) or not np.isfinite(narrow_var):
+            continue
+
+        obs = _SampleObs(
+            narrow_mean=narrow_mean,
+            narrow_var=max(narrow_var, 1e-6),
+            n_obs=len(vtl_flat),
+        )
+
+        observations.setdefault(group, {}).setdefault(speaker, []).append(obs)
+
+    return observations
+
+
+# ---------------------------------------------------------------------------
+# Apply group priors to estimator
+# ---------------------------------------------------------------------------
+
+def _apply_group_priors(
+    estimator: BayesianVTLEstimator,
+    group_priors: Optional[dict] = None,
+) -> None:
     """Register group-level VTL overrides if provided.
 
-    Values may be plain floats (vtl_mm) or ``(vtl_mm, strength)`` tuples
-    to also override the per-group prior strength (n0).
+    Values may be plain floats (vtl_mm) or ``(vtl_mm, sigma_mm)`` tuples.
     """
     if group_priors:
         for group, val in group_priors.items():
             if isinstance(val, (list, tuple)):
-                vtl_mm, strength = val
-                smoother.register_group_override(group, vtl_mm, strength=strength)
+                vtl_mm, sigma_mm = val
+                estimator.register_group_override(group, vtl_mm, sigma_mm=sigma_mm)
             else:
-                smoother.register_group_override(group, val)
+                estimator.register_group_override(group, val)
 
+
+# ---------------------------------------------------------------------------
+# Convergence-based dataset labeller
+# ---------------------------------------------------------------------------
 
 def label_dataset(
     samples: list[dict],
@@ -353,7 +421,13 @@ def label_dataset(
     group_priors: Optional[dict[str, float]] = None,
 ) -> list[dict]:
     """
-    Run the full three-pass labelling pipeline on a dataset.
+    Run the Bayesian convergence-based labelling pipeline on a dataset.
+
+    The pipeline iterates:
+      1. Extract all samples using current speaker VTL posteriors
+      2. Fit per-sample GMM to separate signal from noise
+      3. Update Bayesian posteriors (group → speaker)
+      4. Check convergence; repeat until group μ stabilises
 
     Parameters
     ----------
@@ -362,16 +436,11 @@ def label_dataset(
     extractor : FormantExtractor backend (uses PraatFormantExtractor if None)
     sr        : sample rate (used if not present in sample dict)
     verbose   : print progress
+    group_priors : optional dict of group → vtl_mm or (vtl_mm, sigma_mm)
 
     Returns
     -------
-    List of transposed sample dicts — one per input sample, matching the
-    output schema in the module docstring.
-
-    Notes
-    -----
-    Guard top-level script calls with ``if __name__ == "__main__":`` to
-    avoid worker re-spawning on Windows/macOS (spawn start method).
+    List of transposed sample dicts — one per input sample.
     """
     if cfg is None:
         cfg = LabellerConfig()
@@ -386,114 +455,137 @@ def label_dataset(
         print(f"[labeller] {len(samples)} samples, "
               f"{n_workers} worker{'s' if n_workers != 1 else ''}.")
 
-    # -----------------------------------------------------------------------
+    # -------------------------------------------------------------------
     # Seed: multi-position VTL estimate per sample (parallel)
-    # -----------------------------------------------------------------------
+    # -------------------------------------------------------------------
     if verbose:
-        print("[labeller] Seeding VTL smoother...")
+        print("[labeller] Seeding VTL estimates...")
 
-    seed_args    = [(s, cfg, extractor) for s in samples]
+    seed_args = [(s, cfg, extractor) for s in samples]
     if n_workers == 1:
         seed_results = [_worker_seed_vtl(a) for a in seed_args]
     else:
         with ProcessPoolExecutor(max_workers=n_workers) as pool:
             seed_results = list(pool.map(_worker_seed_vtl, seed_args))
 
-    smoother_raw = VTLSmoother(cfg.vtl_prior_strength, cfg.vtl_sample_alpha)
-    _apply_group_priors(smoother_raw, group_priors)
-    for group, speaker, vtl in seed_results:
-        smoother_raw.update(group, speaker, vtl)
+    # Initialise Bayesian estimator
+    estimator = BayesianVTLEstimator(prior_sigma_mm=cfg.vtl_prior_sigma_mm)
+    _apply_group_priors(estimator, group_priors)
 
-    # -----------------------------------------------------------------------
-    # Pass 0
-    # -----------------------------------------------------------------------
-    if verbose:
-        print("[labeller] Pass 0 -- raw extraction...")
-
-    pass0 = _parallel_map(
-        _make_worker_args(samples, cfg, smoother_raw, extractor),
-        n_workers, verbose, "pass0",
-    )
-
-    smoother_first = VTLSmoother(cfg.vtl_prior_strength, cfg.vtl_sample_alpha)
-    _apply_group_priors(smoother_first, group_priors)
-    for s_out in pass0:
-        vtls = s_out["vtl_sample_mm"]
-        vtls = vtls[np.isfinite(vtls)]
-        if len(vtls):
-            smoother_first.update(s_out["group"], s_out["speaker"], float(np.mean(vtls)))
-
-    # -----------------------------------------------------------------------
-    # Pass 1
-    # -----------------------------------------------------------------------
-    if verbose:
-        print(f"\n[labeller] Pass 1 -- refining VTL estimates...")
-
-    pass1 = _parallel_map(
-        _make_worker_args(samples, cfg, smoother_first, extractor),
-        n_workers, verbose, "pass1",
-    )
-
-    smoother_second = VTLSmoother(cfg.vtl_prior_strength, cfg.vtl_sample_alpha)
-    _apply_group_priors(smoother_second, group_priors)
-    for s_out in pass1:
-        vtls = s_out["vtl_sample_mm"]
-        vtls = vtls[np.isfinite(vtls)]
-        if len(vtls):
-            smoother_second.update(s_out["group"], s_out["speaker"], float(np.mean(vtls)))
-
-    # -----------------------------------------------------------------------
-    # Pass 2: frozen per-speaker VTL, no sample-level blend
-    # -----------------------------------------------------------------------
-    if verbose:
-        print(f"\n[labeller] Pass 2 -- final formant assignment...")
-
-    frozen_args = []
+    # Register speaker overrides from SpeakerMeta
     for s in samples:
-        speaker   = s.get("speaker", "unknown")
-        meta      = s.get("speaker_meta")
-        group     = (meta.vtl_class if isinstance(meta, SpeakerMeta)
-                     else s.get("group", "unknown"))
-        final_vtl = smoother_second.smoothed_speaker_vtl(group, speaker)
-        frozen    = VTLSmoother(prior_strength=0.0, sample_alpha=cfg.vtl_sample_alpha)
-        frozen._speaker_vtls[speaker] = [final_vtl]
-        frozen._group_vtls[group]     = [final_vtl]
-        if meta and isinstance(meta, SpeakerMeta) and meta.vtl_prior_mm is not None:
-            frozen.register_speaker_override(speaker, meta.vtl_prior_mm)
-        frozen_args.append((dict(s), cfg, frozen, extractor))
+        meta = s.get("speaker_meta")
+        if isinstance(meta, SpeakerMeta) and meta.vtl_prior_mm is not None:
+            estimator.register_speaker_override(s["speaker"], meta.vtl_prior_mm)
 
-    pass2 = _parallel_map(frozen_args, n_workers, verbose, "pass2")
+    # Seed the estimator with rough VTL estimates
+    for group, speaker, vtl in seed_results:
+        if np.isfinite(vtl):
+            estimator.seed_speaker(group, speaker, vtl)
+
+    # -------------------------------------------------------------------
+    # Convergence loop
+    # -------------------------------------------------------------------
+    results = None
+    for iteration in range(cfg.vtl_max_iterations):
+        prev_mus = estimator.group_mus()
+
+        if verbose:
+            print(f"[labeller] Iteration {iteration} — extracting...")
+
+        # Extract all samples with current speaker VTL posteriors
+        worker_args = _make_worker_args(samples, cfg, estimator, extractor)
+        results = _parallel_map(worker_args, n_workers, verbose,
+                                f"iter{iteration}")
+
+        if verbose:
+            print()
+
+        # Fit GMMs and update posteriors
+        observations = _fit_gmms(results, cfg)
+        estimator.update_all(observations)
+
+        # Check convergence
+        current_mus = estimator.group_mus()
+        if verbose:
+            for g, mu in sorted(current_mus.items()):
+                prev = prev_mus.get(g, mu)
+                sigma = estimator.group_vtl(g).sigma
+                print(f"  group={g}: μ={mu:.1f}mm (Δ={mu-prev:+.2f}mm) σ={sigma:.1f}mm")
+
+        if iteration > 0 and estimator.has_converged(
+                prev_mus, threshold=cfg.vtl_convergence_threshold_mm):
+            if verbose:
+                print(f"[labeller] Converged after {iteration + 1} iterations.")
+            break
+    else:
+        if verbose:
+            print(f"[labeller] Reached max iterations ({cfg.vtl_max_iterations}).")
+
+    # -------------------------------------------------------------------
+    # Final pass with converged VTL estimates
+    # -------------------------------------------------------------------
+    if verbose:
+        print("[labeller] Final extraction with converged VTL estimates...")
+
+    worker_args = _make_worker_args(samples, cfg, estimator, extractor)
+    final = _parallel_map(worker_args, n_workers, verbose, "final")
+
+    # Add posterior uncertainty and strip transient fields
+    for s_out in final:
+        speaker = s_out["speaker"]
+        s_out["vtl_posterior_mu_mm"] = estimator.speaker_vtl(speaker)
+        s_out["vtl_posterior_sigma_mm"] = estimator.speaker_uncertainty(speaker)
+        s_out.pop("vtl_per_formant", None)
 
     if verbose:
         n_voiced = sum(
-            int(np.isfinite(s["f0_hz"]).any()) for s in pass2
+            int(np.isfinite(s["f0_hz"]).any()) for s in final
         )
-        print(f"\n[labeller] Done. {len(pass2)} samples "
+        print(f"\n[labeller] Done. {len(final)} samples "
               f"({n_voiced} with at least one voiced window).")
 
-    return pass2
+    return final
 
 
 # ---------------------------------------------------------------------------
 # Incremental labelling: add new samples using an existing labelled dataset
 # ---------------------------------------------------------------------------
 
-def _smoother_from_labelled(
+def _estimator_from_labelled(
     labelled: list[dict],
     cfg: LabellerConfig,
-) -> VTLSmoother:
+) -> BayesianVTLEstimator:
     """
-    Build a VTLSmoother pre-populated from vtl_sample_mm arrays in an
-    already-labelled dataset.  Uses per-speaker means so each speaker
-    contributes one effective observation to the smoother, consistent with
-    how inter-pass aggregation works in label_dataset().
+    Build a BayesianVTLEstimator from an already-labelled dataset.
+
+    Each speaker's mean vtl_sample_mm becomes a tight-variance observation,
+    reflecting the confidence from prior labelling.
     """
-    smoother = VTLSmoother(cfg.vtl_prior_strength, cfg.vtl_sample_alpha)
+    estimator = BayesianVTLEstimator(prior_sigma_mm=cfg.vtl_prior_sigma_mm)
+
+    # Collect per-speaker mean VTL
+    speaker_vtls: dict[str, list[float]] = {}
+    speaker_group: dict[str, str] = {}
     for s in labelled:
         vtls = s["vtl_sample_mm"][np.isfinite(s["vtl_sample_mm"])]
         if len(vtls):
-            smoother.update(s["group"], s["speaker"], float(np.mean(vtls)))
-    return smoother
+            speaker = s["speaker"]
+            group = s["group"]
+            speaker_vtls.setdefault(speaker, []).append(float(np.mean(vtls)))
+            speaker_group[speaker] = group
+
+    # Build observations for the estimator
+    observations: dict[str, dict[str, list[_SampleObs]]] = {}
+    for speaker, vtls in speaker_vtls.items():
+        group = speaker_group[speaker]
+        mean_vtl = float(np.mean(vtls))
+        var_vtl = max(float(np.var(vtls, ddof=1)) if len(vtls) > 1 else 25.0, 1.0)
+        obs = _SampleObs(narrow_mean=mean_vtl, narrow_var=var_vtl, n_obs=len(vtls))
+        observations.setdefault(group, {}).setdefault(speaker, []).append(obs)
+
+    estimator.update_all(observations)
+    return estimator
 
 
 def label_incremental(
@@ -508,38 +600,15 @@ def label_incremental(
 ) -> list[dict]:
     """
     Label new samples using the pooled VTL statistics from an already-labelled
-    dataset for smoothing, without re-running the full pipeline on everything.
+    dataset, without re-running the full pipeline on everything.
 
     When ``refine=False`` (default):
-        A seed pass is first run on ``new_samples`` to estimate each new
-        speaker's VTL from their own audio, making the formant ceiling
-        independent of the group prior.  A single pass-2-equivalent
-        extraction then runs using a smoother combining the existing dataset
-        statistics with the freshly seeded speaker VTLs.  Only the newly
-        labelled samples are returned.
+        Single-pass extraction using an estimator built from existing data +
+        seed VTL from new samples.  Only the newly labelled samples are returned.
 
     When ``refine=True``:
-        After the initial single-pass labelling of ``new_samples``, a full
-        three-pass label_dataset() run is performed over the combined dataset
-        (existing + new).  The full combined result is returned, so existing
-        labels are updated as well.  Use this when the new samples represent
-        a meaningfully different demographic and you want the smoothed VTL
-        estimates to reflect the combined distribution.
-
-    Parameters
-    ----------
-    new_samples : unlabelled sample dicts (same format as label_dataset input)
-    existing    : already-labelled sample dicts (output of label_dataset)
-    cfg         : LabellerConfig (uses defaults if None)
-    sr          : fallback sample rate
-    refine      : if True, re-run the full pipeline over the combined dataset
-    verbose     : print progress
-
-    Returns
-    -------
-    If refine=False: list of newly labelled sample dicts (len == len(new_samples))
-    If refine=True:  combined list (existing re-labelled + new), len ==
-                     len(existing) + len(new_samples)
+        Full convergence-loop pipeline over the combined dataset
+        (existing + new).  The full combined result is returned.
     """
     if cfg is None:
         cfg = LabellerConfig()
@@ -555,9 +624,9 @@ def label_incremental(
         print(f"[label_incremental] {len(new_samples)} new samples, "
               f"{len(existing)} existing — refine={refine}.")
 
-    # Build smoother from existing labelled data
-    smoother = _smoother_from_labelled(existing, cfg)
-    _apply_group_priors(smoother, group_priors)
+    # Build estimator from existing labelled data
+    estimator = _estimator_from_labelled(existing, cfg)
+    _apply_group_priors(estimator, group_priors)
 
     if verbose:
         groups = {}
@@ -567,54 +636,48 @@ def label_incremental(
                     else s.get("group", "unknown"))
             groups[g] = groups.get(g, 0) + 1
         breakdown = ", ".join(f"{g}={n}" for g, n in sorted(groups.items()))
-        print(f"[label_incremental] Smoother seeded from existing: {breakdown}")
+        print(f"[label_incremental] Estimator seeded from existing: {breakdown}")
 
-    # Seed per-speaker VTL for new speakers from their own audio before the
-    # main pass.  Without this the formant ceiling is derived purely from the
-    # group prior, making the ceiling — and therefore the pole assignment —
-    # sensitive to the group label even when vtl_sample_alpha is high.
+    # Seed per-speaker VTL for new speakers
     if verbose:
         print("[label_incremental] Seeding VTL for new speakers...")
 
-    seed_args    = [(s, cfg, extractor) for s in new_samples]
+    seed_args = [(s, cfg, extractor) for s in new_samples]
     if n_workers == 1:
         seed_results = [_worker_seed_vtl(a) for a in seed_args]
     else:
         with ProcessPoolExecutor(max_workers=n_workers) as pool:
             seed_results = list(pool.map(_worker_seed_vtl, seed_args))
 
+    # Register speaker overrides from SpeakerMeta
+    for s in new_samples:
+        meta = s.get("speaker_meta")
+        if isinstance(meta, SpeakerMeta) and meta.vtl_prior_mm is not None:
+            estimator.register_speaker_override(s["speaker"], meta.vtl_prior_mm)
+
     for group, speaker, vtl in seed_results:
-        smoother.update(group, speaker, vtl)
+        if np.isfinite(vtl):
+            estimator.seed_speaker(group, speaker, vtl)
 
     if verbose:
         new_speakers = {s.get("speaker", "unknown") for s in new_samples}
         for spk in sorted(new_speakers):
-            s_   = next((s for s in new_samples if s.get("speaker") == spk), {})
-            meta = s_.get("speaker_meta")
-            grp  = (meta.vtl_class if isinstance(meta, SpeakerMeta)
-                    else s_.get("group", "unknown"))
-            vtl  = smoother.smoothed_speaker_vtl(grp, spk)
-            print(f"  seeded {spk} ({grp}): VTL={vtl:.1f}mm")
+            vtl = estimator.speaker_vtl(spk)
+            print(f"  seeded {spk}: VTL={vtl:.1f}mm")
 
-    # Single pass with frozen per-speaker VTL (pass-2 equivalent)
+    # Single pass with current estimator
     if verbose:
         print("[label_incremental] Labelling new samples (single pass)...")
 
-    frozen_args = []
-    for s in new_samples:
-        speaker   = s.get("speaker", "unknown")
-        meta      = s.get("speaker_meta")
-        group     = (meta.vtl_class if isinstance(meta, SpeakerMeta)
-                     else s.get("group", "unknown"))
-        final_vtl = smoother.smoothed_speaker_vtl(group, speaker)
-        frozen    = VTLSmoother(prior_strength=0.0, sample_alpha=cfg.vtl_sample_alpha)
-        frozen._speaker_vtls[speaker] = [final_vtl]
-        frozen._group_vtls[group]     = [final_vtl]
-        if meta and isinstance(meta, SpeakerMeta) and meta.vtl_prior_mm is not None:
-            frozen.register_speaker_override(speaker, meta.vtl_prior_mm)
-        frozen_args.append((dict(s), cfg, frozen, extractor))
+    worker_args = _make_worker_args(new_samples, cfg, estimator, extractor)
+    new_labelled = _parallel_map(worker_args, n_workers, verbose, "incremental")
 
-    new_labelled = _parallel_map(frozen_args, n_workers, verbose, "incremental")
+    # Add posterior info and strip transient fields
+    for s_out in new_labelled:
+        speaker = s_out["speaker"]
+        s_out["vtl_posterior_mu_mm"] = estimator.speaker_vtl(speaker)
+        s_out["vtl_posterior_sigma_mm"] = estimator.speaker_uncertainty(speaker)
+        s_out.pop("vtl_per_formant", None)
 
     if verbose:
         n_voiced = sum(int(np.isfinite(s["f0_hz"]).any()) for s in new_labelled)
@@ -628,12 +691,11 @@ def label_incremental(
     if verbose:
         print("[label_incremental] Running refinement pass over combined dataset...")
 
-    # Strip labeller output keys from existing so label_dataset receives
-    # clean input dicts (it only needs the raw audio + metadata fields).
     _output_keys = {
         "t_centre_s", "loudness_dbfs", "spectral_slope", "f0_hz", "periodicity",
         "f0_praat_hz", "formant_hz", "formant_bw_hz",
-        "vtl_sample_mm", "window_length_ms", "hop_ms",
+        "vtl_sample_mm", "vtl_per_formant", "vtl_posterior_mu_mm",
+        "vtl_posterior_sigma_mm", "window_length_ms", "hop_ms",
         "outlier_flags", "outlier_mask",
     }
     def _strip(s: dict) -> dict:
@@ -658,31 +720,7 @@ def probe_raw_formants(
     """
     Run a single raw extraction pass on one sample per group per vowel,
     with no multi-pass smoothing.  The VTL prior is the bare literature
-    value for each group — no data-driven blending is applied.
-
-    Selection rules
-    ---------------
-    - Only vowels present in every group are included (intersection).
-      Falls back to the union with a warning if the intersection is empty.
-    - One sample is chosen per (group, vowel) pair.
-    - No speaker appears more than once across the entire probe set.
-    - Where a vowel cannot be filled for a group without reusing a speaker,
-      it is skipped and a note is printed.
-
-    Intended for sanity checking: compare returned formant_hz / vtl_sample_mm
-    against your expectations before committing to a full label_dataset() run.
-
-    Parameters
-    ----------
-    samples : same list passed to label_dataset()
-    cfg     : LabellerConfig (uses defaults if None)
-    sr      : fallback sample rate
-    verbose : print selection summary
-
-    Returns
-    -------
-    List of transposed sample dicts (same schema as label_dataset() output).
-    No smoothing, no multi-pass VTL correction.
+    value for each group.
     """
     if cfg is None:
         cfg = LabellerConfig()
@@ -693,8 +731,6 @@ def probe_raw_formants(
         s.setdefault("sr", sr)
 
     # --- Selection: no duplicate speakers or vowels; same vowel set per group ---
-
-    # Pass 1: find which vowels are available in every group
     vowels_by_group: dict[str, set[str]] = defaultdict(set)
     for s in samples:
         g = s.get("group", s.get("speaker", "unknown"))
@@ -704,15 +740,12 @@ def probe_raw_formants(
         if vowels_by_group else set()
 
     if not shared_vowels:
-        # Fall back to the union if no vowel appears in every group
         shared_vowels = set.union(*vowels_by_group.values()) if vowels_by_group else set()
         if verbose:
             print("[probe_raw_formants] WARNING: no vowels common to all groups; "
                   "using union instead")
 
-    # Pass 2: for each group pick one sample per shared vowel,
-    # never reusing the same speaker
-    group_selections: dict[str, dict[str, dict]] = defaultdict(dict)  # group -> vowel -> sample
+    group_selections: dict[str, dict[str, dict]] = defaultdict(dict)
     used_speakers: set[str] = set()
 
     for s in samples:
@@ -722,9 +755,9 @@ def probe_raw_formants(
 
         if vowel not in shared_vowels:
             continue
-        if vowel in group_selections[g]:          # vowel already filled for this group
+        if vowel in group_selections[g]:
             continue
-        if speaker in used_speakers:              # speaker already used in any group
+        if speaker in used_speakers:
             continue
 
         group_selections[g][vowel] = s
@@ -746,19 +779,17 @@ def probe_raw_formants(
             print(f"  NOTE: some vowels could not be filled without reusing a speaker: "
                   + ", ".join(f"{g}:{v}" for g, vs in missing.items() for v in vs))
 
-    # Build a literature-only smoother — alpha=0 at every level means the
-    # smooth_vtl() call returns the literature prior unchanged for any sample
-    # VTL, giving us a clean baseline without any data influence.
-    lit_smoother = VTLSmoother(prior_strength=0.0, sample_alpha=0.0)
-
+    # Use literature prior VTL for each sample's group
     results = []
     for s in selected:
         speaker = s.get("speaker", s.get("group", "unknown"))
         group   = s.get("group", speaker)
+        lit_vtl = VTL_PRIOR_MM.get(group, VTL_PRIOR_MM["unknown"])
         if verbose:
             print(f"  probing speaker={speaker!r} group={group!r} "
                   f"label={s.get('label', '?')!r}")
-        result = _extract_sample(s, cfg, lit_smoother, extractor)
+        result = _extract_sample(s, cfg, lit_vtl, extractor)
+        result.pop("vtl_per_formant", None)
         results.append(result)
 
     return results
@@ -773,33 +804,11 @@ def probe_full(
     verbose: bool = True,
 ) -> list[dict]:
     """
-    Run the full three-pass label_dataset() pipeline on a small representative
-    subset: up to ``speakers_per_group`` speakers per group, all vowels.
-
-    Selection rules
-    ---------------
-    - Speakers are chosen greedily in dataset order.
-    - No speaker appears in more than one group's quota (global uniqueness).
-    - All samples belonging to the selected speakers are included, so the
-      VTL smoother sees the same multi-vowel context as a real run.
-
-    Parameters
-    ----------
-    samples            : same list passed to label_dataset()
-    cfg                : LabellerConfig (uses defaults if None)
-    sr                 : fallback sample rate
-    speakers_per_group : how many speakers to include per group (default 2)
-    verbose            : passed through to label_dataset()
-
-    Returns
-    -------
-    List of transposed sample dicts (same schema as label_dataset() output),
-    one per selected sample.
+    Run the full convergence-based pipeline on a small representative subset.
     """
     if cfg is None:
         cfg = LabellerConfig()
 
-    # --- Select speakers ---
     group_speakers: dict[str, list[str]] = defaultdict(list)
     used_speakers:  set[str]             = set()
 
@@ -819,7 +828,6 @@ def probe_full(
         )
         print(f"[probe_full] Selected: {breakdown}")
 
-    # --- Collect all samples for selected speakers ---
     selected = [
         s for s in samples
         if s.get("speaker", s.get("group", "unknown")) in used_speakers

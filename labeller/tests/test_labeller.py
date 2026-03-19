@@ -6,9 +6,8 @@ Runner for the labeller regression test suite.
 Imports and executes all tests from the split test modules:
   test_labeller_config.py    — R08  LabellerConfig validation
   test_labeller_formants.py  — R01-R03  _vtl_from_formants, _assign_formant_indices
-  test_labeller_smoother.py  — R04-R07  VTLSmoother
+  test_labeller_bayesian.py  — R04-R07, R11-R13  BayesianVTLEstimator + GMM
   test_synth_vowels.py       — R09-R10  synth-based integration
-  test_synth_compat.py       — R11     synth-to-labelled conversion
 
 Run individual modules to test a specific area, or run this file to
 execute the full suite and print a combined summary.
@@ -24,17 +23,19 @@ from test_labeller_formants import (
     test_r02_nyquist_slots,
     test_r03_slot_ordering,
 )
-from test_labeller_smoother import (
+from test_labeller_bayesian import (
     test_r04_group_convergence,
-    test_r05_smoother_monotonicity,
+    test_r05_posterior_monotonicity,
     test_r06_speaker_anchors_to_group,
     test_r07_override_bypasses_group,
+    test_r11_gmm_separation,
+    test_r12_conjugate_update,
+    test_r13_convergence,
 )
 from test_synth_vowels import (
     test_r09_synth_vtl_from_assigned,
     test_r10_synth_group_estimate,
 )
-from test_synth_compat import test_r11_synth_to_labelled
 
 
 if __name__ == "__main__":
@@ -42,13 +43,15 @@ if __name__ == "__main__":
     test_r02_nyquist_slots()
     test_r03_slot_ordering()
     test_r04_group_convergence()
-    test_r05_smoother_monotonicity()
+    test_r05_posterior_monotonicity()
     test_r06_speaker_anchors_to_group()
     test_r07_override_bypasses_group()
     test_r08_alpha_clamp()
     test_r09_synth_vtl_from_assigned()
     test_r10_synth_group_estimate()
-    test_r11_synth_to_labelled()
+    test_r11_gmm_separation()
+    test_r12_conjugate_update()
+    test_r13_convergence()
 
     n_fail = _print_summary()
     raise SystemExit(0 if n_fail == 0 else 1)

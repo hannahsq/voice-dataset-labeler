@@ -92,7 +92,9 @@ _LABELLER_ERR = ""
 try:
     from labeller import (
         LabellerConfig,
-        VTLSmoother,
+        BayesianVTLEstimator,
+        NormalPosterior,
+        fit_vtl_mixture,
         SpeakerMeta,
         _vtl_from_formants,
         _assign_formant_indices,
@@ -105,7 +107,8 @@ except Exception:
     _LABELLER_OK = False
     _LABELLER_ERR = traceback.format_exc()
     # Provide stubs so other modules can import without crashing
-    LabellerConfig = VTLSmoother = SpeakerMeta = None
+    LabellerConfig = BayesianVTLEstimator = NormalPosterior = SpeakerMeta = None
+    fit_vtl_mixture = None
     _vtl_from_formants = _assign_formant_indices = None
     SPEED_OF_SOUND_MM_S = N_FORMANTS = VTL_PRIOR_MM = None
 

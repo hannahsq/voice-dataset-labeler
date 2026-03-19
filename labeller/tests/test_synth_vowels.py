@@ -5,8 +5,8 @@ R09  Synth-based: VTL estimate from assigned formants (low F0, 4 speakers)
 R10  Synth-based: group estimate from corpus of heterogeneous speakers
 
 These use synth.py for ground-truth signals where the exact VTL is known,
-testing the full chain: synth → _assign_formant_indices → _vtl_from_formants
-→ VTLSmoother.
+testing the full chain: synth -> _assign_formant_indices -> _vtl_from_formants
+-> BayesianVTLEstimator.
 """
 
 from __future__ import annotations
@@ -17,20 +17,14 @@ from test_labeller_registry import (
     _check, _approx,
     _LABELLER_OK, _SYNTH_OK,
     _vtl_from_formants, _assign_formant_indices,
-    VTLSmoother, VTL_PRIOR_MM,
+    BayesianVTLEstimator, VTL_PRIOR_MM,
     _synth_neutral,
 )
+from labeller.bayesian_vtl import _SampleObs
 
 
 # ---------------------------------------------------------------------------
 # R09  Synth-based: VTL estimate from assigned formants  [EMPIRICAL]
-#
-# For four synthetic speakers with known VTL (spanning small/medium/large),
-# run _assign_formant_indices on the exact synth formants and verify that
-# _vtl_from_formants returns an estimate within 10 mm of the true VTL.
-#
-# Tolerance rationale: with exact neutral-tube poles the error should be < 1mm;
-# 10mm covers the case where assignment drops a slot or Nyquist clips one.
 # ---------------------------------------------------------------------------
 
 def test_r09_synth_vtl_from_assigned():
@@ -72,13 +66,9 @@ def test_r09_synth_vtl_from_assigned():
 # ---------------------------------------------------------------------------
 # R10  Synth-based: group estimate from a mixed corpus  [EMPIRICAL]
 #
-# Build a small per-group corpus using synth (3 speakers × 5 vowels each),
-# feed the per-sample VTL estimates into VTLSmoother, and verify that the
-# group estimate is within 8 mm of the true VTL mean for each group.
-#
-# This is the most end-to-end regression test that doesn't require running
-# the full pipeline: it validates that synth → _assign_formant_indices →
-# _vtl_from_formants → VTLSmoother produces sensible group-level estimates.
+# Build a small per-group corpus using synth (3 speakers x 5 vowels each),
+# feed the per-sample VTL estimates into BayesianVTLEstimator, and verify
+# that the group estimate is within 8 mm of the true VTL mean for each group.
 # ---------------------------------------------------------------------------
 
 def test_r10_synth_group_estimate():
@@ -100,13 +90,16 @@ def test_r10_synth_group_estimate():
         ("large",  [168.0, 174.0, 178.0]),
     ]
 
-    smoother = VTLSmoother(prior_strength=10.0)
-    rng      = np.random.default_rng(0)
+    estimator = BayesianVTLEstimator(prior_sigma_mm=15.0)
+
+    # Collect observations per group/speaker
+    observations: dict[str, dict[str, list[_SampleObs]]] = {}
 
     for group, true_vtls in groups:
+        observations[group] = {}
         for i, vtl_mm in enumerate(true_vtls):
             spk_id = f"{group}_spk{i}"
-            # Different f0 per vowel to mimic pitch variation
+            vtl_estimates = []
             for j, f0_hz in enumerate(np.linspace(80, 220, N_VOWEL)):
                 _, meta = _synth_neutral(vtl_mm, f0_hz=float(f0_hz),
                                          sr=SR, seed=i * 10 + j)
@@ -117,11 +110,22 @@ def test_r10_synth_group_estimate():
                 )
                 est_vtl = _vtl_from_formants(f_assigned)
                 if np.isfinite(est_vtl):
-                    smoother.update(group, spk_id, est_vtl)
+                    vtl_estimates.append(est_vtl)
+
+            if vtl_estimates:
+                mean_vtl = float(np.mean(vtl_estimates))
+                var_vtl = max(float(np.var(vtl_estimates, ddof=1))
+                              if len(vtl_estimates) > 1 else 25.0, 1.0)
+                observations[group][spk_id] = [
+                    _SampleObs(narrow_mean=mean_vtl, narrow_var=var_vtl,
+                               n_obs=len(vtl_estimates))
+                ]
+
+    estimator.update_all(observations)
 
     for group, true_vtls in groups:
         true_mean = float(np.mean(true_vtls))
-        group_est = smoother.smoothed_group_vtl(group)
+        group_est = estimator.group_vtl(group).mu
         _approx(f"R10_group_estimate_{group}",
                 group_est, true_mean, TOL_MM,
                 detail=(f"group_est={group_est:.2f}mm "

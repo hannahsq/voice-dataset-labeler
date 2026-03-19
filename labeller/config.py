@@ -83,8 +83,12 @@ class LabellerConfig:
     max_f0_hz:              float = 600.0
     max_formant_hz:         float = 5500.0
     n_praat_formants:       int   = N_FORMANTS  # upper bound; Nyquist-clipped per window
-    vtl_prior_strength:     float = 10.0    # n0 for uncertainty-weighted blend
-    vtl_sample_alpha:       float = 0.30    # fixed sample-level blend fraction [0, 0.9]
+    vtl_prior_strength:     float = 10.0    # DEPRECATED — kept for backward compat
+    vtl_sample_alpha:       float = 0.30    # DEPRECATED — kept for backward compat
+    vtl_prior_sigma_mm:          float = 15.0   # group-level prior σ (mm)
+    vtl_max_iterations:          int   = 5      # convergence loop hard cap
+    vtl_convergence_threshold_mm: float = 0.5   # Δμ_group threshold for convergence
+    vtl_gmm_min_obs:             int   = 6      # minimum obs before fitting GMM
     voicing_threshold_dbfs: float = -40.0
     f0_agreement_threshold: float = 0.10
     n_jobs:                 int   = -1      # -1 = all CPUs, 1 = serial
@@ -93,12 +97,7 @@ class LabellerConfig:
     preemphasis_from_hz:    float = 50.0    # used only when adaptive_preemphasis=False
 
     def __post_init__(self):
-        if not (0.0 <= self.vtl_sample_alpha <= 0.9):
-            raise ValueError(
-                f"vtl_sample_alpha={self.vtl_sample_alpha} is outside [0.0, 0.9]. "
-                f"Values above 0.9 risk cascading formant misassignment from "
-                f"degenerate per-window VTL estimates."
-            )
+        pass  # vtl_sample_alpha validation removed (deprecated field)
 
 
 @dataclass
