@@ -290,6 +290,37 @@ class BayesianVTLEstimator:
         sigma_sq = max(float(var_mm), 1.0)
         self._speaker_posteriors[speaker] = NormalPosterior(vtl_mm, sigma_sq)
 
+    def update_groups_from_speakers(self) -> None:
+        """Update group posteriors and spread from current speaker posteriors.
+
+        Call after seeding to ensure group estimates reflect the seed data
+        rather than just the literature priors.
+        """
+        # Collect speakers per group
+        group_speakers: dict[str, list[str]] = {}
+        for spk, grp in self._speaker_to_group.items():
+            if (spk in self._speaker_posteriors
+                    and spk not in self._speaker_override_mm):
+                group_speakers.setdefault(grp, []).append(spk)
+
+        for group, speakers in group_speakers.items():
+            if not speakers:
+                continue
+
+            # Update group mean posterior
+            prior = self._group_prior(group)
+            post = prior
+            for spk in speakers:
+                sp = self._speaker_posteriors[spk]
+                post = post.conjugate_update(sp.mu, sp.sigma_sq, 1)
+            self._group_posteriors[group] = post
+
+            # Update between-speaker spread
+            if len(speakers) >= 2:
+                spk_mus = np.array([self._speaker_posteriors[spk].mu
+                                    for spk in speakers])
+                self._group_spread_sq[group] = _iqr_var(spk_mus)
+
     # -- Public interface: update from observations -------------------------
 
     def update_all(

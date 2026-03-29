@@ -90,6 +90,7 @@ class LabellerConfig:
     vtl_convergence_threshold_mm: float = 0.5   # Δμ_group threshold for convergence
     vtl_gmm_min_obs:             int   = 6      # minimum obs before fitting GMM
     vtl_use_gmm:                 bool  = True   # False = single Gaussian (baseline)
+    vtl_reseed_sigma:            float = 3.0    # reseed speakers outside n*spread_σ of group mean (0 = disabled)
     voicing_threshold_dbfs: float = -40.0
     f0_agreement_threshold: float = 0.10
     n_jobs:                 int   = -1      # -1 = all CPUs, 1 = serial

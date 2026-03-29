@@ -337,12 +337,24 @@ def _make_worker_args(
     cfg: LabellerConfig,
     estimator: BayesianVTLEstimator,
     extractor: FormantExtractor,
+    use_group_ceiling: bool = False,
 ) -> list[tuple]:
-    """Build worker args using speaker VTL from the Bayesian estimator."""
+    """Build worker args using speaker VTL from the Bayesian estimator.
+
+    If use_group_ceiling is True, use the group prior VTL for the ceiling
+    instead of the per-speaker estimate.  This breaks the ceiling feedback
+    loop on iteration 0 where speaker estimates may be unreliable.
+    """
     args = []
     for s in samples:
         speaker = s.get("speaker", "unknown")
-        vtl_mm = estimator.speaker_vtl(speaker)
+        if use_group_ceiling:
+            meta = s.get("speaker_meta")
+            group = (meta.vtl_class if isinstance(meta, SpeakerMeta)
+                     else s.get("group", "unknown"))
+            vtl_mm = estimator.group_vtl(group).mu
+        else:
+            vtl_mm = estimator.speaker_vtl(speaker)
         args.append((s, cfg, vtl_mm, extractor))
     return args
 
@@ -536,6 +548,10 @@ def label_dataset(
         if np.isfinite(vtl):
             estimator.seed_speaker(group, speaker, vtl, var)
 
+    # Update group posteriors from seed data so iteration 0's group ceiling
+    # reflects the actual data rather than literature priors
+    estimator.update_groups_from_speakers()
+
     if verbose:
         _dump_estimator(estimator, "post-seed")
 
@@ -549,8 +565,11 @@ def label_dataset(
         if verbose:
             print(f"[labeller] Iteration {iteration} — extracting...")
 
-        # Extract all samples with current speaker VTL posteriors
-        worker_args = _make_worker_args(samples, cfg, estimator, extractor)
+        # Extract all samples — use group ceiling on iter 0 to avoid
+        # ceiling feedback loop from potentially noisy seed VTL estimates
+        worker_args = _make_worker_args(
+            samples, cfg, estimator, extractor,
+            use_group_ceiling=(iteration == 0))
         results = _parallel_map(worker_args, n_workers, verbose,
                                 f"iter{iteration}")
 
@@ -569,8 +588,10 @@ def label_dataset(
                       f"speaker overrides: {sorted(estimator._speaker_override_mm)}")
             estimator._speaker_override_mm.clear()
 
-        # Reseed speakers that have drifted outside 3σ of group spread
-        reseeded = estimator.reseed_outliers(n_sigma=3.0, verbose=verbose)
+        # Reseed speakers that have drifted outside n*σ of group spread
+        if cfg.vtl_reseed_sigma > 0:
+            reseeded = estimator.reseed_outliers(
+                n_sigma=cfg.vtl_reseed_sigma, verbose=verbose)
 
         # Check convergence
         current_mus = estimator.group_mus()
