@@ -29,7 +29,9 @@ from .bayesian_vtl import (
     BayesianVTLEstimator,
     NormalPosterior,
     fit_vtl_mixture,
+    fit_vtl_single,
     _SampleObs,
+    _iqr_var,
 )
 from extractors import FormantExtractor, PraatFormantExtractor
 
@@ -227,12 +229,12 @@ def _worker_extract(args: tuple[dict, LabellerConfig, float, FormantExtractor]) 
 
 def _worker_seed_vtl(
     args: tuple[dict, LabellerConfig, FormantExtractor],
-) -> tuple[str, str, float]:
+) -> tuple[str, str, float, float]:
     """
     Compute a robust median VTL estimate from up to 20 intensity-gated
     positions across a sample.  Used to seed the estimator before the
     convergence loop.
-    Returns (group, speaker, median_vtl_mm).
+    Returns (group, speaker, median_vtl_mm, var_vtl_mm).
     """
     s, cfg, extractor = args
     audio    = s["audio"].astype(np.float32)
@@ -266,7 +268,8 @@ def _worker_seed_vtl(
         n         = len(audio)
         raw_f, _, _ = extractor(audio[n//4 : 3*n//4], sr, win_s,
                                 max_formant_hz=ceiling, n_formants=n_seed)
-        return group, speaker, _vtl_from_formants(raw_f)
+        v = _vtl_from_formants(raw_f)
+        return group, speaker, v, 225.0  # no variance info, use wide default
 
     prior_vtl = VTL_PRIOR_MM.get(group, VTL_PRIOR_MM["unknown"])
     ceiling   = _formant_ceiling_hz(prior_vtl)
@@ -284,7 +287,11 @@ def _worker_seed_vtl(
         if np.isfinite(v):
             vtls.append(v)
 
-    return group, speaker, (float(np.median(vtls)) if vtls else np.nan)
+    if not vtls:
+        return group, speaker, np.nan, 225.0
+    median_vtl = float(np.median(vtls))
+    var_vtl = _iqr_var(np.array(vtls))
+    return group, speaker, median_vtl, var_vtl
 
 
 # ---------------------------------------------------------------------------
@@ -353,6 +360,7 @@ def _fit_gmms(
 
     Returns dict[group, dict[speaker, list[_SampleObs]]].
     """
+    from scipy.stats import skew as _skew_fn
     observations: dict[str, dict[str, list[_SampleObs]]] = {}
 
     for s_out in results:
@@ -370,16 +378,20 @@ def _fit_gmms(
         if len(vtl_flat) < 2:
             continue
 
-        narrow_mean, narrow_var, _ = fit_vtl_mixture(
+        fitter = fit_vtl_mixture if cfg.vtl_use_gmm else fit_vtl_single
+        narrow_mean, narrow_var, _ = fitter(
             vtl_flat, min_obs=cfg.vtl_gmm_min_obs)
 
         if not np.isfinite(narrow_mean) or not np.isfinite(narrow_var):
             continue
 
+        sample_skew = float(_skew_fn(vtl_flat)) if len(vtl_flat) >= 3 else 0.0
+
         obs = _SampleObs(
             narrow_mean=narrow_mean,
             narrow_var=max(narrow_var, 1e-6),
-            n_obs=len(vtl_flat),
+            n_obs=1,
+            skew=sample_skew,
         )
 
         observations.setdefault(group, {}).setdefault(speaker, []).append(obs)
@@ -411,6 +423,47 @@ def _apply_group_priors(
 # ---------------------------------------------------------------------------
 # Convergence-based dataset labeller
 # ---------------------------------------------------------------------------
+
+def _dump_estimator(estimator: BayesianVTLEstimator, label: str) -> None:
+    """Print a diagnostic snapshot of the estimator state."""
+    print(f"\n--- estimator state [{label}] ---")
+    print("  Groups:")
+    from scipy.stats import skew as _skew
+    for g, post in sorted(estimator._group_posteriors.items()):
+        spread = estimator._group_spread_sq.get(g)
+        spread_str = f"  spread_σ={np.sqrt(spread):.2f}mm" if spread is not None else ""
+        # Skewness of speaker means within this group
+        spk_in_g = [spk for spk, grp in estimator._speaker_to_group.items()
+                     if grp == g and spk in estimator._speaker_posteriors
+                     and spk not in estimator._speaker_override_mm]
+        if len(spk_in_g) >= 3:
+            mus = np.array([estimator._speaker_posteriors[s].mu for s in spk_in_g])
+            skew_val = float(_skew(mus))
+            skew_str = f"  skew={skew_val:+.2f}"
+        else:
+            skew_str = ""
+        print(f"    {g}: μ={post.mu:.2f}mm  mean_σ={post.sigma:.2f}mm{spread_str}{skew_str}")
+    print("  Speakers:")
+    for spk in sorted(estimator._speaker_posteriors):
+        post = estimator._speaker_posteriors[spk]
+        grp = estimator._speaker_to_group.get(spk, "?")
+        override = " [OVERRIDE]" if spk in estimator._speaker_override_mm else ""
+        spk_obs_list = []
+        for obs_group in getattr(estimator, '_last_observations', {}).values():
+            if spk in obs_group:
+                spk_obs_list.extend(obs_group[spk])
+        obs_means = [o.narrow_mean for o in spk_obs_list if np.isfinite(o.narrow_mean)]
+        if len(obs_means) >= 3:
+            # Skew across multiple samples
+            skew_str = f"  skew={float(_skew(obs_means)):+.2f}"
+        elif len(spk_obs_list) == 1 and spk_obs_list[0].skew != 0.0:
+            # Fall back to within-sample skew
+            skew_str = f"  skew={spk_obs_list[0].skew:+.2f}*"
+        else:
+            skew_str = ""
+        print(f"    {spk} ({grp}): μ={post.mu:.2f}mm  σ={post.sigma:.2f}mm{override}{skew_str}")
+    print("---\n")
+
 
 def label_dataset(
     samples: list[dict],
@@ -479,9 +532,12 @@ def label_dataset(
             estimator.register_speaker_override(s["speaker"], meta.vtl_prior_mm)
 
     # Seed the estimator with rough VTL estimates
-    for group, speaker, vtl in seed_results:
+    for group, speaker, vtl, var in seed_results:
         if np.isfinite(vtl):
-            estimator.seed_speaker(group, speaker, vtl)
+            estimator.seed_speaker(group, speaker, vtl, var)
+
+    if verbose:
+        _dump_estimator(estimator, "post-seed")
 
     # -------------------------------------------------------------------
     # Convergence loop
@@ -505,6 +561,17 @@ def label_dataset(
         observations = _fit_gmms(results, cfg)
         estimator.update_all(observations)
 
+        # After first iteration, release speaker overrides so they can
+        # be refined by data (the override served its purpose as a seed)
+        if iteration == 0 and estimator._speaker_override_mm:
+            if verbose:
+                print(f"  [unfreeze] Releasing {len(estimator._speaker_override_mm)} "
+                      f"speaker overrides: {sorted(estimator._speaker_override_mm)}")
+            estimator._speaker_override_mm.clear()
+
+        # Reseed speakers that have drifted outside 3σ of group spread
+        reseeded = estimator.reseed_outliers(n_sigma=3.0, verbose=verbose)
+
         # Check convergence
         current_mus = estimator.group_mus()
         if verbose:
@@ -512,6 +579,9 @@ def label_dataset(
                 prev = prev_mus.get(g, mu)
                 sigma = estimator.group_vtl(g).sigma
                 print(f"  group={g}: μ={mu:.1f}mm (Δ={mu-prev:+.2f}mm) σ={sigma:.1f}mm")
+
+        if verbose:
+            _dump_estimator(estimator, f"iter{iteration}")
 
         if iteration > 0 and estimator.has_converged(
                 prev_mus, threshold=cfg.vtl_convergence_threshold_mm):
@@ -655,9 +725,9 @@ def label_incremental(
         if isinstance(meta, SpeakerMeta) and meta.vtl_prior_mm is not None:
             estimator.register_speaker_override(s["speaker"], meta.vtl_prior_mm)
 
-    for group, speaker, vtl in seed_results:
+    for group, speaker, vtl, var in seed_results:
         if np.isfinite(vtl):
-            estimator.seed_speaker(group, speaker, vtl)
+            estimator.seed_speaker(group, speaker, vtl, var)
 
     if verbose:
         new_speakers = {s.get("speaker", "unknown") for s in new_samples}

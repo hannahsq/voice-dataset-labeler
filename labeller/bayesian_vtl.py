@@ -46,6 +46,26 @@ class NormalPosterior:
 
 
 # ---------------------------------------------------------------------------
+# Robust variance estimate
+# ---------------------------------------------------------------------------
+
+def _iqr_var(x: np.ndarray, floor: float = 1.0) -> float:
+    """IQR-based robust variance estimate.
+
+    For a normal distribution IQR ≈ 1.35σ, so σ² ≈ (IQR/1.35)².
+    Falls back to np.var(ddof=1) when fewer than 4 observations
+    (IQR is unreliable with very few points).
+    """
+    if len(x) < 4:
+        return max(float(np.var(x, ddof=1)) if len(x) > 1 else 225.0, floor)
+    q75, q25 = np.percentile(x, [75, 25])
+    iqr = q75 - q25
+    if iqr <= 0:
+        return max(float(np.var(x, ddof=1)), floor)
+    return max((iqr / 1.35) ** 2, floor)
+
+
+# ---------------------------------------------------------------------------
 # 1D two-component Gaussian mixture model (EM from scratch)
 # ---------------------------------------------------------------------------
 
@@ -82,7 +102,7 @@ def fit_vtl_mixture(
         return m, 225.0, 1.0  # 15mm² default variance
 
     if len(x) < min_obs:
-        return float(np.mean(x)), float(np.var(x, ddof=1)), 1.0
+        return float(np.mean(x)), _iqr_var(x), 1.0
 
     # EM initialisation: split at the median
     med = float(np.median(x))
@@ -137,6 +157,27 @@ def fit_vtl_mixture(
     return float(mu[narrow]), float(var[narrow]), float(pi[narrow])
 
 
+def fit_vtl_single(
+    vtl_obs: np.ndarray,
+    min_obs: int = 6,       # unused, kept for signature compat
+    max_iter: int = 50,     # unused
+    tol: float = 1e-4,      # unused
+) -> tuple[float, float, float]:
+    """Fit a single Gaussian to VTL observations (no mixture separation).
+
+    Same return signature as fit_vtl_mixture: (mean, var, weight=1.0).
+    Use this as a baseline to test whether the GMM helps.
+    """
+    x = np.asarray(vtl_obs, dtype=np.float64)
+    x = x[np.isfinite(x)]
+
+    if len(x) < 2:
+        m = float(np.mean(x)) if len(x) else np.nan
+        return m, 225.0, 1.0
+
+    return float(np.median(x)), _iqr_var(x), 1.0
+
+
 # ---------------------------------------------------------------------------
 # Hierarchical Bayesian VTL estimator
 # ---------------------------------------------------------------------------
@@ -147,6 +188,7 @@ class _SampleObs:
     narrow_mean: float
     narrow_var: float
     n_obs: int
+    skew: float = 0.0
 
 
 class BayesianVTLEstimator:
@@ -167,6 +209,11 @@ class BayesianVTLEstimator:
 
         # Group-level posteriors (initialised lazily from literature priors)
         self._group_posteriors: dict[str, NormalPosterior] = {}
+
+        # Between-speaker spread per group (empirical variance of speaker
+        # means within the group).  This does NOT shrink with more speakers —
+        # it's a property of the population, not uncertainty about the mean.
+        self._group_spread_sq: dict[str, float] = {}
 
         # Speaker-level posteriors
         self._speaker_posteriors: dict[str, NormalPosterior] = {}
@@ -200,10 +247,12 @@ class BayesianVTLEstimator:
                 self._speaker_posteriors[speaker] = NormalPosterior(
                     self._speaker_override_mm[speaker], 1.0)
             else:
-                # Inherit group posterior
+                # Inherit group mean + between-speaker spread
+                spread_sq = self._group_spread_sq.get(
+                    group, self._prior_sigma_sq)
                 self._speaker_posteriors[speaker] = NormalPosterior(
                     self._group_posteriors[group].mu,
-                    self._group_posteriors[group].sigma_sq,
+                    spread_sq,
                 )
 
     # -- Public interface: overrides ----------------------------------------
@@ -228,17 +277,18 @@ class BayesianVTLEstimator:
 
     def seed_speaker(
         self, group: str, speaker: str, vtl_mm: float,
+        var_mm: float = 225.0,
     ) -> None:
         """Register a rough initial VTL estimate for a speaker (from seed
-        pass).  This sets the speaker posterior to a moderately confident
-        estimate centered on vtl_mm."""
+        pass).  Uses the data-derived variance from the seed positions if
+        available, otherwise falls back to a wide default (225 mm²)."""
         self._ensure_group(group)
         self._speaker_to_group[speaker] = group
         if speaker in self._speaker_override_mm:
             return  # don't overwrite manual overrides
-        # Seed: moderately confident (σ² = prior_σ²)
-        self._speaker_posteriors[speaker] = NormalPosterior(
-            vtl_mm, self._prior_sigma_sq)
+        # Use data-derived variance, clamped to a reasonable floor
+        sigma_sq = max(float(var_mm), 1.0)
+        self._speaker_posteriors[speaker] = NormalPosterior(vtl_mm, sigma_sq)
 
     # -- Public interface: update from observations -------------------------
 
@@ -253,6 +303,7 @@ class BayesianVTLEstimator:
         observations : dict[group, dict[speaker, list[_SampleObs]]]
             Nested dict of per-sample GMM results.
         """
+        self._last_observations = observations
         # 1. Update speaker posteriors from their sample observations
         for group, speakers in observations.items():
             self._ensure_group(group)
@@ -263,11 +314,16 @@ class BayesianVTLEstimator:
                     # Override speakers: allow tiny data-driven adjustment
                     prior = NormalPosterior(
                         self._speaker_override_mm[speaker], 1.0)
+                elif speaker in self._speaker_posteriors:
+                    # Existing speaker: keep previous posterior as prior
+                    prior = self._speaker_posteriors[speaker]
                 else:
-                    # Normal speakers: use current group posterior as prior
+                    # New speaker: inherit group mean + between-speaker spread
+                    spread_sq = self._group_spread_sq.get(
+                        group, self._prior_sigma_sq)
                     prior = NormalPosterior(
                         self._group_posteriors[group].mu,
-                        self._group_posteriors[group].sigma_sq,
+                        spread_sq,
                     )
 
                 # Pool all sample observations for this speaker
@@ -292,17 +348,54 @@ class BayesianVTLEstimator:
             if not speakers_in_group:
                 continue
 
+            # 2a. Update group mean posterior (uncertainty about the mean)
             prior = self._group_prior(group)
             post = prior
             for spk in speakers_in_group:
                 sp = self._speaker_posteriors[spk]
-                # Each speaker posterior contributes as an observation
-                # with variance = speaker posterior variance
                 post = post.conjugate_update(sp.mu, sp.sigma_sq, 1)
-
             self._group_posteriors[group] = post
 
+            # 2b. Compute between-speaker spread (population variance).
+            # This does NOT shrink with more speakers — it reflects the
+            # natural VTL diversity within the group.
+            # Use IQR-based estimate for robustness against outlier speakers.
+            if len(speakers_in_group) >= 2:
+                spk_mus = np.array([self._speaker_posteriors[spk].mu
+                                    for spk in speakers_in_group])
+                self._group_spread_sq[group] = _iqr_var(spk_mus)
+
     # -- Public interface: queries ------------------------------------------
+
+    def reseed_outliers(self, n_sigma: float = 3.0, verbose: bool = False) -> list[str]:
+        """Reset speakers whose posterior mean is > n_sigma from their
+        group mean (using between-speaker spread).  Returns list of
+        reseeded speaker IDs."""
+        reseeded = []
+        for group, post in self._group_posteriors.items():
+            spread_sq = self._group_spread_sq.get(
+                group, self._prior_sigma_sq)
+            spread = np.sqrt(spread_sq)
+            lo = post.mu - n_sigma * spread
+            hi = post.mu + n_sigma * spread
+
+            for spk, grp in list(self._speaker_to_group.items()):
+                if grp != group:
+                    continue
+                if spk in self._speaker_override_mm:
+                    continue
+                if spk not in self._speaker_posteriors:
+                    continue
+                sp = self._speaker_posteriors[spk]
+                if sp.mu < lo or sp.mu > hi:
+                    if verbose:
+                        print(f"  [reseed] {spk}: μ={sp.mu:.1f}mm "
+                              f"outside [{lo:.1f}, {hi:.1f}]mm "
+                              f"→ reset to group μ={post.mu:.1f}mm")
+                    self._speaker_posteriors[spk] = NormalPosterior(
+                        post.mu, spread_sq)
+                    reseeded.append(spk)
+        return reseeded
 
     def speaker_vtl(self, speaker: str) -> float:
         """Return posterior mean VTL for a speaker (mm)."""

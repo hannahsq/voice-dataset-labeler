@@ -89,6 +89,7 @@ class LabellerConfig:
     vtl_max_iterations:          int   = 5      # convergence loop hard cap
     vtl_convergence_threshold_mm: float = 0.5   # Δμ_group threshold for convergence
     vtl_gmm_min_obs:             int   = 6      # minimum obs before fitting GMM
+    vtl_use_gmm:                 bool  = True   # False = single Gaussian (baseline)
     voicing_threshold_dbfs: float = -40.0
     f0_agreement_threshold: float = 0.10
     n_jobs:                 int   = -1      # -1 = all CPUs, 1 = serial

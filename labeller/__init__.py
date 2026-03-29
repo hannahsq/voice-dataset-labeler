@@ -114,6 +114,7 @@ from .bayesian_vtl import (
     NormalPosterior,
     BayesianVTLEstimator,
     fit_vtl_mixture,
+    fit_vtl_single,
 )
 
 # --- extractors ---
