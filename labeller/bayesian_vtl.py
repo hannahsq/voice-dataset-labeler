@@ -15,6 +15,11 @@ import numpy as np
 
 from .config import VTL_PRIOR_MM
 
+# Physical cap — no human vocal tract exceeds this.  Estimates above this
+# are extraction artefacts (formant mis-assignment).  Used to prevent
+# runaway group means that corrupt the whole hierarchy.
+_VTL_PHYSICAL_MAX_MM = 210.0
+
 
 # ---------------------------------------------------------------------------
 # Normal posterior — the atomic unit of Bayesian VTL estimation
@@ -367,6 +372,11 @@ class BayesianVTLEstimator:
                         post = post.conjugate_update(
                             obs.narrow_mean, obs.narrow_var, obs.n_obs)
 
+                # Cap at physical maximum — estimates above this are
+                # formant mis-assignment artefacts, not real VTL.
+                if post.mu > _VTL_PHYSICAL_MAX_MM:
+                    post = NormalPosterior(_VTL_PHYSICAL_MAX_MM, post.sigma_sq)
+
                 self._speaker_posteriors[speaker] = post
 
         # 2. Update group posteriors from speaker posteriors
@@ -401,7 +411,13 @@ class BayesianVTLEstimator:
     def reseed_outliers(self, n_sigma: float = 3.0, verbose: bool = False) -> list[str]:
         """Reset speakers whose posterior mean is > n_sigma from their
         group mean (using between-speaker spread).  Returns list of
-        reseeded speaker IDs."""
+        reseeded speaker IDs.
+
+        Outlier bounds are computed from the current group posterior.
+        Reseeded speakers are reset to the group's *initial prior* (from
+        literature / seed data), NOT the current group mean — this
+        prevents a corrupted group mean from infecting all speakers.
+        """
         reseeded = []
         for group, post in self._group_posteriors.items():
             spread_sq = self._group_spread_sq.get(
@@ -409,6 +425,10 @@ class BayesianVTLEstimator:
             spread = np.sqrt(spread_sq)
             lo = post.mu - n_sigma * spread
             hi = post.mu + n_sigma * spread
+
+            # Reset target is the initial prior, not the (possibly
+            # corrupted) current group mean
+            prior = self._group_prior(group)
 
             for spk, grp in list(self._speaker_to_group.items()):
                 if grp != group:
@@ -422,9 +442,9 @@ class BayesianVTLEstimator:
                     if verbose:
                         print(f"  [reseed] {spk}: μ={sp.mu:.1f}mm "
                               f"outside [{lo:.1f}, {hi:.1f}]mm "
-                              f"→ reset to group μ={post.mu:.1f}mm")
+                              f"→ reset to prior μ={prior.mu:.1f}mm")
                     self._speaker_posteriors[spk] = NormalPosterior(
-                        post.mu, spread_sq)
+                        prior.mu, spread_sq)
                     reseeded.append(spk)
         return reseeded
 

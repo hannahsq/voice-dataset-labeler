@@ -40,14 +40,22 @@ from extractors import FormantExtractor, PraatFormantExtractor
 # Shared helpers: formant ceiling and pole count from a VTL estimate
 # ---------------------------------------------------------------------------
 
+_VTL_PHYSICAL_MAX_MM = 210.0   # longest plausible adult male vocal tract
+
+
 def _formant_ceiling_hz(vtl_mm: float) -> float:
     """
     Praat max-formant ceiling for a speaker with the given VTL.
     (N_FORMANTS + 0.5) * delta_F gives half a spacing of headroom above
     the top expected formant, suppressing spurious high-frequency poles.
     Clamped to [4500, 8000] Hz.
+
+    VTL is capped at _VTL_PHYSICAL_MAX_MM to prevent runaway feedback:
+    an inflated VTL estimate → low ceiling → Praat misses formants →
+    even more inflated VTL on the next iteration.
     """
-    delta_f = SPEED_OF_SOUND_MM_S / (2.0 * vtl_mm)
+    vtl_capped = min(vtl_mm, _VTL_PHYSICAL_MAX_MM)
+    delta_f = SPEED_OF_SOUND_MM_S / (2.0 * vtl_capped)
     return float(np.clip((N_FORMANTS + 0.5) * delta_f, 4500.0, 8000.0))
 
 
@@ -56,8 +64,11 @@ def _n_praat_formants(vtl_mm: float, nyquist_hz: float, cfg_max: int) -> int:
     Number of Praat poles to request: floor(nyquist / delta_F), clipped to
     [1, cfg_max].  Prevents Praat from fitting spurious poles in a spectral
     region where no real formants can exist.
+
+    VTL is capped at _VTL_PHYSICAL_MAX_MM (same rationale as ceiling).
     """
-    delta_f = SPEED_OF_SOUND_MM_S / (2.0 * vtl_mm)
+    vtl_capped = min(vtl_mm, _VTL_PHYSICAL_MAX_MM)
+    delta_f = SPEED_OF_SOUND_MM_S / (2.0 * vtl_capped)
     return max(1, min(cfg_max, int(np.floor(nyquist_hz / delta_f))))
 
 
